@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/Pancake.Server/Pancake.Server.csproj" DefaultStartup="true" />
+  <Project Path="src/Pancake.Shared/Pancake.Shared.csproj" />
+  <Project Path="tests/ServerLogic/ServerLogic.csproj" />
+</Solution>

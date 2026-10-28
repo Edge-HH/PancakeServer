@@ -1,0 +1,136 @@
+name: 📦 构建与发布
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要构建的版本号，例如 1.2.3（手动运行只生成产物，不创建 Release）"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: 🏷️ 解析并校验版本号
+        id: version
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.ref_name }}
+          MANUAL_VERSION: ${{ inputs.version }}
+        run: |
+          $version = if ($env:EVENT_NAME -eq 'push') { $env:TAG_NAME.TrimStart('v', 'V') } else { $env:MANUAL_VERSION }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "版本号必须使用 major.minor.patch 格式，例如 1.2.3。"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 获取项目代码
+        uses: actions/checkout@v5
+
+      - name: 🛠️ 配置 .NET 8
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: 🧪 集控服务端测试
+        run: dotnet run --project ./tests/ServerLogic/ServerLogic.csproj -c Release --nologo
+
+  build:
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # 自带运行环境：服务器上无需安装 .NET。
+          - name: win-x64
+            rid: win-x64
+            archive: zip
+          - name: linux-x64
+            rid: linux-x64
+            archive: tar.gz
+          - name: linux-arm64
+            rid: linux-arm64
+            archive: tar.gz
+          # 框架依赖：体积小，任意平台装好 ASP.NET Core 8 Runtime 后用 dotnet Pancake.Server.dll 启动。
+          - name: portable
+            rid: ""
+            archive: zip
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PACKAGE: PancakeServer-${{ matrix.name }}-${{ needs.version.outputs.version }}
+    steps:
+      - name: 📥 获取项目代码
+        uses: actions/checkout@v5
+
+      - name: 🛠️ 配置 .NET 8
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: 📦 发布服务端
+        shell: pwsh
+        env:
+          RID: ${{ matrix.rid }}
+        run: |
+          $runtimeArgs = if ($env:RID) { @('-r', $env:RID, '--self-contained', 'true') } else { @('--self-contained', 'false') }
+          dotnet publish ./src/Pancake.Server/Pancake.Server.csproj `
+            -c Release `
+            @runtimeArgs `
+            -p:Version=$env:VERSION `
+            -o "./artifacts/$env:PACKAGE" `
+            --nologo
+          if ($LASTEXITCODE -ne 0) { throw "发布失败。" }
+          if (-not (Test-Path "./artifacts/$env:PACKAGE/board-assets/HarmonyOS_Sans_SC_Regular.ttf")) { throw "大屏字体资源未进入发布目录。" }
+          if (-not (Test-Path "./artifacts/$env:PACKAGE/wwwroot/index.html")) { throw "网页控制台未进入发布目录。" }
+
+      - name: 🗜️ 打包
+        working-directory: artifacts
+        run: |
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd "$PACKAGE" && zip -qr "../$PACKAGE.zip" .)
+          else
+            tar -czf "$PACKAGE.tar.gz" -C "$PACKAGE" .
+          fi
+
+      - name: 📤 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PACKAGE }}
+          path: artifacts/${{ env.PACKAGE }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push'
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 📥 下载全部产物
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 🎉 创建 GitHub 正式发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" artifacts/* \
+            --repo "${{ github.repository }}" \
+            --verify-tag \
+            --generate-notes \
+            --title "Pancake Server ${{ github.ref_name }}"

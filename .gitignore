@@ -1,0 +1,7 @@
+.vs/
+**/bin/
+**/obj/
+artifacts/
+src/Pancake.Server/*.db*
+pancake.db*
+src/Pancake.Server/assets/

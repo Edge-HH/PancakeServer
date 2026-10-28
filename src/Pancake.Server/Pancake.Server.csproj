@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Pancake.Server</RootNamespace>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <Version>1.1.0</Version>
+    <!-- 本地 dotnet publish/build -o artifacts 的输出不能再被当作内容文件递归打包。 -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts/**;*.db;*.db-*</DefaultItemExcludes>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Pancake.Shared\Pancake.Shared.csproj" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.20" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="8.0.20">
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.20" />
+  </ItemGroup>
+  <!-- 网页设置预览与大屏使用同一套字体、图标和示例底图（取自桌面端 Pancake 仓库的 Assets，桌面端更新这些文件时需同步过来）。 -->
+  <ItemGroup>
+    <None Include="BoardAssets\**" Link="board-assets\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
