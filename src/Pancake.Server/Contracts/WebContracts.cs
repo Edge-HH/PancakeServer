@@ -74,3 +74,19 @@ public sealed record AnnouncementWriteRequest(string Title, string? Body, string
 public sealed record BroadcastRequest(List<Guid> ClassIds, string Title, string? Body, string? Level, bool Pinned, DateTime? StartsAt, DateTime? ExpiresAt);
 public sealed record AnnouncementListItem(Guid Id, Guid ClassId, string ClassName, string Title, string Body, string Level, bool Pinned,
     DateTime CreatedAt, DateTime UpdatedAt, DateTime? StartsAt, DateTime? ExpiresAt, string Author, bool Active);
+
+// ---------- 考试模式
+/// <summary>考试计划列表项：Dates 是有安排的日期，ClassIds 是展开后的目标班级。</summary>
+public sealed record ExamPlanListItem(Guid Id, string Name, bool Enabled, long Revision,
+    List<DateOnly> Dates, int SegmentCount, List<Guid> ClassIds, List<string> ClassNames,
+    DateTime CreatedAt, DateTime UpdatedAt, string UpdatedBy);
+public sealed record ExamPlanDetail(Guid Id, string Name, bool Enabled, long Revision,
+    Pancake.Shared.ExamSchedulePayload Schedule, List<Guid> ClassIds, DateTime CreatedAt, DateTime UpdatedAt, string UpdatedBy);
+/// <summary>ClassIds 为展开后的目标班级；ExpectedRevision 0 表示新建，非 0 时版本不符返回 409。</summary>
+public sealed record ExamPlanWriteRequest(string Name, Pancake.Shared.ExamSchedulePayload Schedule, List<Guid> ClassIds, bool Enabled, long ExpectedRevision = 0);
+public sealed record ExamEnabledRequest(bool Enabled, long ExpectedRevision);
+
+/// <summary>考场名按班级保存；网页在考试页统一查看与设置。</summary>
+public sealed record ClassExamRoomItem(Guid ClassId, string ClassName, Guid? GroupId, string? GroupName, string Room);
+public sealed record ExamRoomItem(Guid ClassId, string Room);
+public sealed record ExamRoomWriteRequest(List<ExamRoomItem> Items);

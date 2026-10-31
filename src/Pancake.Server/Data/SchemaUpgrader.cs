@@ -29,6 +29,7 @@ public static class SchemaUpgrader
         AddColumn(db, "Devices", "ScreenJson", "TEXT NOT NULL DEFAULT ''");
         AddColumn(db, "Devices", "ScreenAt", "TEXT NULL");
         AddColumn(db, "Classes", "GroupId", "TEXT NULL");
+        AddColumn(db, "Classes", "ExamRoom", "TEXT NOT NULL DEFAULT ''");
         db.Database.ExecuteSqlRaw("""
             CREATE TABLE IF NOT EXISTS "ClassGroups" (
                 "Id" TEXT NOT NULL CONSTRAINT "PK_ClassGroups" PRIMARY KEY,
@@ -90,6 +91,20 @@ public static class SchemaUpgrader
                 "UpdatedAt" TEXT NOT NULL, "Author" TEXT NOT NULL, "Deleted" INTEGER NOT NULL);
             """);
         db.Database.ExecuteSqlRaw("""CREATE INDEX IF NOT EXISTS "IX_Announcements_ClassId" ON "Announcements" ("ClassId");""");
+        db.Database.ExecuteSqlRaw("""
+            CREATE TABLE IF NOT EXISTS "ExamPlans" (
+                "Id" TEXT NOT NULL CONSTRAINT "PK_ExamPlans" PRIMARY KEY,
+                "Name" TEXT NOT NULL, "PayloadJson" TEXT NOT NULL, "Enabled" INTEGER NOT NULL,
+                "Revision" INTEGER NOT NULL, "CreatedAt" TEXT NOT NULL, "UpdatedAt" TEXT NOT NULL,
+                "CreatedBy" TEXT NOT NULL, "UpdatedBy" TEXT NOT NULL);
+            """);
+        db.Database.ExecuteSqlRaw("""CREATE INDEX IF NOT EXISTS "IX_ExamPlans_Enabled" ON "ExamPlans" ("Enabled");""");
+        db.Database.ExecuteSqlRaw("""
+            CREATE TABLE IF NOT EXISTS "ExamPlanClasses" (
+                "ExamPlanId" TEXT NOT NULL, "ClassId" TEXT NOT NULL,
+                CONSTRAINT "PK_ExamPlanClasses" PRIMARY KEY ("ExamPlanId", "ClassId"));
+            """);
+        db.Database.ExecuteSqlRaw("""CREATE INDEX IF NOT EXISTS "IX_ExamPlanClasses_ClassId" ON "ExamPlanClasses" ("ClassId");""");
     }
 
     private static void AddColumn(PancakeDbContext db, string table, string column, string definition)

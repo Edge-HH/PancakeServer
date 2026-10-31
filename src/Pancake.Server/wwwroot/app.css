@@ -592,3 +592,31 @@ kbd { margin-left: 4px; padding: 1px 5px; border-radius: 4px; background: color-
   .hw-bar, #hw-body, .hw-save { display: none !important; }
   .print-only { display: block; }
 }
+
+/* ---------- 考试模式 */
+.exam-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 12px; }
+.exam-card .card-body { display: grid; gap: 8px; }
+.exam-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--text-2); }
+.exam-meta .icon { width: 14px; height: 14px; }
+.exam-editor { display: grid; gap: 16px; }
+.exam-editor .card-body.grid-2 { align-items: end; }
+.exam-day + .exam-day { margin-top: 16px; padding-top: 16px; border-top: 1px dashed var(--border); }
+.exam-segments { display: grid; gap: 6px; margin-top: 10px; }
+.exam-seg { display: grid; grid-template-columns: 92px minmax(140px, 1fr) 118px 118px 30px; gap: 6px; align-items: center; }
+.exam-seg .input.sm { padding: 0 8px; }
+.exam-classes { display: grid; gap: 8px; }
+.exam-class-group { display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-sunken); }
+.exam-class-items { display: flex; flex-wrap: wrap; gap: 6px 18px; }
+.exam-class-item { display: inline-flex; align-items: center; gap: 6px; font-size: 13.5px; }
+.exam-class-group input[type="checkbox"], .exam-class-item input[type="checkbox"], .card input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); }
+@media (max-width: 720px) {
+  .exam-seg { grid-template-columns: 1fr 1fr; }
+  .exam-seg > button { grid-column: 2; justify-self: end; }
+}
+
+/* ---------- 考试模式：考场名 */
+.exam-rooms { margin-top: 16px; }
+.exam-rooms .card-body { display: grid; gap: 12px; }
+.exam-room-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px 14px; }
+.exam-room-item { display: grid; gap: 4px; font-size: 13px; }
+.exam-room-item > span { color: var(--text-2); }

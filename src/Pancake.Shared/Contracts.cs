@@ -35,6 +35,7 @@ public static class SyncEventTypes
     public const string Command = "command";
     public const string Editing = "editing";
     public const string Screen = "screen";
+    public const string Exam = "exam";
 }
 
 /// <summary>
@@ -107,6 +108,35 @@ public sealed record DutyToday(DateOnly Date, string Label, List<DutyTaskAssignm
 /// Upcoming 是 24 小时内将开始的定时公告，大屏到点自行显示，不必等下一次同步；旧客户端会忽略它。
 /// </summary>
 public sealed record BoardInfo(Guid DeviceId, string ClassName, List<AnnouncementItem> Announcements, DutyToday? Duty, long LayoutRevision, string LayoutPolicy, DateTime ServerTime, List<AnnouncementItem>? Upcoming = null);
+
+// ------------------------------------------------------------------ 考试模式
+
+public static class ExamSegmentKinds
+{
+    public const string Exam = "exam";     // 考试段：Subject 必填
+    public const string Break = "break";   // 休息段：Label 为显示文案（默认“休息时间”）
+}
+
+/// <summary>
+/// 考试时间表的一段。StartMinute/EndMinute 是当天 00:00 起的分钟数（0–1440），避免 UTC/本地时区混用；
+/// 日期由所在 ExamDayDto 提供。
+/// </summary>
+public sealed record ExamSegmentDto(string Kind, string Subject, int StartMinute, int EndMinute, string? Label = null);
+
+public sealed record ExamDayDto(DateOnly Date, List<ExamSegmentDto> Segments);
+
+/// <summary>
+/// 考试计划的完整时间表；EnterMinutesBefore 为开考前提前进入考试画面的分钟数（只作用于当天第一场）。
+/// ShowSeconds 控制考试画面的大时钟与倒计时是否显示到秒。
+/// </summary>
+public sealed record ExamSchedulePayload(List<ExamDayDto> Days, int EnterMinutesBefore = 5, bool ShowSeconds = true);
+
+/// <summary>
+/// 下发给大屏的考试安排；ServerTime（UTC）供客户端校准本地时钟，RoomName 是该班级的考场名。
+/// 无启用计划时设备端点返回 204。
+/// </summary>
+public sealed record ExamScheduleDto(Guid PlanId, string PlanName, List<ExamDayDto> Days, int EnterMinutesBefore,
+    DateTime ServerTime, bool ShowSeconds = true, string? RoomName = null);
 
 /// <summary>项目内容里引用服务器资源的附件路径前缀，后面跟 SHA-256 与扩展名，例如 asset:ab12…ef.png。</summary>
 public static class AssetReference

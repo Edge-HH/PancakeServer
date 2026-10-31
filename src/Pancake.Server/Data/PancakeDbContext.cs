@@ -18,6 +18,8 @@ public sealed class PancakeDbContext(DbContextOptions<PancakeDbContext> options)
     public DbSet<DutyPlan> DutyPlans => Set<DutyPlan>();
     public DbSet<Announcement> Announcements => Set<Announcement>();
     public DbSet<ClassGroup> ClassGroups => Set<ClassGroup>();
+    public DbSet<ExamPlan> ExamPlans => Set<ExamPlan>();
+    public DbSet<ExamPlanClass> ExamPlanClasses => Set<ExamPlanClass>();
 
     protected override void OnModelCreating(ModelBuilder model)
     {
@@ -37,6 +39,10 @@ public sealed class PancakeDbContext(DbContextOptions<PancakeDbContext> options)
         model.Entity<Student>().HasIndex(x => x.ClassId);
         model.Entity<DutyPlan>().HasKey(x => x.ClassId);
         model.Entity<Announcement>().HasIndex(x => x.ClassId);
+        model.Entity<ExamPlan>().Property(x => x.PayloadJson).HasColumnType("TEXT");
+        model.Entity<ExamPlan>().HasIndex(x => x.Enabled);
+        model.Entity<ExamPlanClass>().HasKey(x => new { x.ExamPlanId, x.ClassId });
+        model.Entity<ExamPlanClass>().HasIndex(x => x.ClassId);
 
         // SQLite 不保存 DateTime.Kind；所有时间按 UTC 写入，读回时标记为 UTC，JSON 才会带上 Z。
         var utc = new Microsoft.EntityFrameworkCore.Storage.ValueConversion.ValueConverter<DateTime, DateTime>(v => v, v => DateTime.SpecifyKind(v, DateTimeKind.Utc));
@@ -67,6 +73,8 @@ public sealed class Classroom
     public string LayoutPolicy { get; set; } = Pancake.Shared.LayoutPolicies.Shared;
     /// <summary>所属的班级分组；为空表示未分组。</summary>
     public Guid? GroupId { get; set; }
+    /// <summary>考场名：考试模式右上角显示，由网页控制台统一设置。</summary>
+    public string ExamRoom { get; set; } = "";
 }
 
 /// <summary>班级分组（年级、校区等）：网页按组归类显示班级，并可以把作业复制到同组的其他班级。</summary>
@@ -210,6 +218,28 @@ public sealed class DutyPlan
     public long Revision { get; set; }
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
     public string UpdatedBy { get; set; } = "";
+}
+
+/// <summary>考试计划：科目与时间表存在 PayloadJson（Pancake.Shared.ExamSchedulePayload），目标班级见 ExamPlanClass。</summary>
+public sealed class ExamPlan
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public string Name { get; set; } = "";
+    public string PayloadJson { get; set; } = "{}";
+    public bool Enabled { get; set; }
+    /// <summary>每次保存或启停 +1，用于网页端冲突检测与实时通知。</summary>
+    public long Revision { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+    public string CreatedBy { get; set; } = "";
+    public string UpdatedBy { get; set; } = "";
+}
+
+/// <summary>考试计划的目标班级（多对多）。</summary>
+public sealed class ExamPlanClass
+{
+    public Guid ExamPlanId { get; set; }
+    public Guid ClassId { get; set; }
 }
 
 public sealed class Announcement

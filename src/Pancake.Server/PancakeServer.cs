@@ -68,6 +68,7 @@ public static class PancakeServer
         app.MapAssetEndpoints();
         app.MapPeopleEndpoints();
         app.MapBoardEndpoints();
+        app.MapExamEndpoints();
         app.MapAdminEndpoints();
         return app;
     }

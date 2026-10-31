@@ -256,6 +256,8 @@ const routes = [
   [/^c\/([^/]+)(?:\/([\w-]+))?$/, viewPublic, { public: true }],
   [/^classes$/, viewClasses],
   [/^classes\/([\w-]+)(?:\/(\w+))?(?:\/([\w-]+))?$/, viewClass],
+  [/^exam$/, viewExam],
+  [/^exam\/([\w-]+)$/, viewExamPlan],
   [/^homework(?:\/([\w-]+))?(?:\/([\w-]+))?$/, (c, p) => toClass(c, p ? 'homework/' + p : 'homework')]
 ];
 let routeToken = 0;
@@ -308,6 +310,7 @@ function shell({ nav, title, crumbs, actions = '', classId = null }) {
             : sections.map(s => html`<optgroup label="${s.group ? s.group.name : '未分组'}">${s.classes.map(option)}</optgroup>`)}</select></label>
           <a href="#/classes/${cid}/homework" class="${nav === 'homework' ? 'active' : ''}">${icon('book')}<span>作业</span></a>` : ''}
         <a href="#/classes" class="${nav === 'classes' ? 'active' : ''}">${icon('class')}<span>${isAdmin() ? '全部班级' : '我的班级'}</span></a>
+        <a href="#/exam" class="${nav === 'exam' ? 'active' : ''}">${icon('calendar')}<span>考试</span></a>
       </nav>
       <div class="sidebar-foot">
         <div class="user-card">${avatar(me.displayName)}<div class="grow"><b>${me.displayName}</b><span>${roleLabel(me.role)}，${me.userName}</span></div></div>
@@ -1074,6 +1077,255 @@ async function viewClasses(query) {
   setPage(page, loading());
   await reload();
   if (query.get('new') && admin) viewActions['new-class']();
+}
+
+// ============================================================ 考试模式
+const examMinutes = time => {
+  const [h, m] = String(time || '').split(':').map(Number);
+  return Number.isFinite(h) && Number.isFinite(m) ? Math.max(0, Math.min(1440, h * 60 + m)) : 0;
+};
+const examTime = minutes => `${pad(Math.floor(minutes / 60))}:${pad(minutes % 60)}`;
+const examDates = dates => !dates || !dates.length ? '未设置日期'
+  : dates.length === 1 ? dateLabel(dates[0], true) : `${dateLabel(dates[0])} ~ ${dateLabel(dates[dates.length - 1])} · ${dates.length} 天`;
+
+async function viewExam() {
+  const page = shell({ nav: 'exam', title: '考试模式', actions: html`<button class="btn primary" data-act="exam-new">${icon('plus')}新建考试计划</button>` });
+  let plans = [], rooms = [];
+  const reload = async () => {
+    [plans, rooms] = await Promise.all([api('/api/admin/exam-plans'), api('/api/admin/exam-rooms').catch(() => [])]);
+    render();
+  };
+  viewActions['exam-new'] = () => navigate('exam/new');
+  viewActions['exam-edit'] = el => navigate('exam/' + el.dataset.id);
+  viewActions['exam-rooms-save'] = async el => {
+    el.disabled = true;
+    try {
+      const items = $$('[data-exam-room]', page).map(input => ({ classId: input.dataset.examRoom, room: input.value.trim() }));
+      rooms = await api('/api/admin/exam-rooms', { method: 'PUT', body: { items } });
+      toast('考场名已保存');
+      render();
+    } catch (err) { fail(err); }
+    finally { el.disabled = false; }
+  };
+  viewActions['exam-toggle'] = async el => {
+    const plan = plans.find(x => x.id === el.dataset.id); if (!plan) return;
+    el.disabled = true;
+    try {
+      await api(`/api/admin/exam-plans/${plan.id}/enabled`, { method: 'PATCH', body: { enabled: !plan.enabled, expectedRevision: plan.revision } });
+      toast(plan.enabled ? '已停用考试计划' : '已启用考试计划');
+    } catch (err) { fail(err); }
+    await reload();
+  };
+  viewActions['exam-delete'] = async el => {
+    const plan = plans.find(x => x.id === el.dataset.id); if (!plan) return;
+    if (!await confirmDialog({ title: '删除考试计划', message: `确定删除“${plan.name}”？大屏会立即退出该计划。`, confirm: '删除' })) return;
+    try { await api(`/api/admin/exam-plans/${plan.id}`, { method: 'DELETE' }); toast('考试计划已删除'); } catch (err) { fail(err); }
+    await reload();
+  };
+  function render() {
+    const plansHtml = plans.length
+      ? html`<div class="exam-list">${plans.map(plan => html`<div class="card exam-card"><div class="card-body">
+          <div class="row"><b class="grow">${plan.name}</b><span class="badge ${plan.enabled ? 'ok' : ''}">${plan.enabled ? '启用中' : '未启用'}</span></div>
+          <div class="exam-meta"><span>${icon('calendar', 'sm')}${examDates(plan.dates)}</span><span>${plan.segmentCount} 个时间段</span><span>${plan.classIds.length} 个班级</span></div>
+          <div class="faint small">${plan.classNames.length ? plan.classNames.join('、') : '未设置班级'}</div>
+          <div class="row wrap">
+            <button class="btn sm" data-act="exam-edit" data-id="${plan.id}">${icon('edit')}编辑</button>
+            <button class="btn sm" data-act="exam-toggle" data-id="${plan.id}">${plan.enabled ? '停用' : '启用'}</button>
+            <span class="grow"></span>
+            <button class="btn sm danger" data-act="exam-delete" data-id="${plan.id}">${icon('trash')}删除</button>
+          </div>
+        </div></div>`)}</div>`
+      : html`<div class="card">${empty('calendar', '还没有考试计划', '保存并启用后，考试到点大屏会自动全屏显示科目和时间；支持一天多场与场间休息。', html`<button class="btn primary" data-act="exam-new">${icon('plus')}新建考试计划</button>`)}</div>`;
+    setPage(page, html`${plansHtml}
+      <div class="card exam-rooms"><div class="card-head"><h3>考场名</h3><span class="faint small">显示在考试画面右上角；每个班级一个</span></div><div class="card-body">
+        ${rooms.length ? html`<div class="exam-room-grid">${rooms.map(room => html`<label class="exam-room-item"><span>${room.groupName ? room.groupName + ' · ' : ''}${room.className}</span><input class="input sm" data-exam-room="${room.classId}" maxlength="40" placeholder="例如 第 12 考场" value="${room.room}"></label>`)}</div>` : html`<p class="faint">没有可管理的班级。</p>`}
+        <div class="row" style="margin-top:12px"><button class="btn primary" data-act="exam-rooms-save">保存考场名</button></div>
+      </div></div>`);
+  }
+  setPage(page, loading());
+  await reload();
+}
+
+async function viewExamPlan(id) {
+  const creating = id === 'new';
+  const detail = creating ? null : await api('/api/admin/exam-plans/' + id);
+  const classes = state.classes || [];
+  const sections = groupClasses(classes);
+  const draft = {
+    name: detail ? detail.name : '',
+    enabled: detail ? detail.enabled : true,
+    enterMinutesBefore: detail ? detail.schedule.enterMinutesBefore : 5,
+    showSeconds: detail ? detail.schedule.showSeconds !== false : true,
+    classIds: new Set(detail ? detail.classIds : []),
+    days: detail
+      ? detail.schedule.days.map(day => ({
+          date: day.date,
+          segments: day.segments.map(seg => ({
+            kind: seg.kind, subject: seg.subject || '', label: seg.label || '',
+            start: examTime(seg.startMinute), end: examTime(seg.endMinute)
+          }))
+        }))
+      : [{ date: todayStr(), segments: [{ kind: 'exam', subject: '', label: '', start: '09:00', end: '10:30' }] }]
+  };
+  const revision = detail ? detail.revision : 0;
+  let dirty = false;
+  const mark = () => { dirty = true; };
+  setLeaveGuard(() => dirty ? '考试计划还没有保存，离开会丢失修改。' : '');
+  const page = shell({
+    nav: 'exam', title: creating ? '新建考试计划' : '编辑考试计划',
+    actions: html`<button class="btn" data-act="exam-back">返回</button><button class="btn primary" data-act="exam-save">保存</button>`
+  });
+
+  viewActions['exam-back'] = async () => {
+    if (dirty && !await confirmDialog({ title: '放弃未保存的修改', message: '考试计划还没有保存，离开会丢失修改。', confirm: '放弃并返回' })) return;
+    dirty = false; navigate('exam');
+  };
+  viewActions['exam-add-day'] = () => {
+    const last = draft.days[draft.days.length - 1];
+    draft.days.push({
+      date: last ? shiftDay(last.date, 1) : todayStr(),
+      segments: [{ kind: 'exam', subject: '', label: '', start: '09:00', end: '10:30' }]
+    });
+    mark(); render();
+  };
+  viewActions['exam-remove-day'] = el => { draft.days.splice(+el.dataset.day, 1); mark(); render(); };
+  viewActions['exam-add-seg'] = el => {
+    const day = draft.days[+el.dataset.day]; if (!day) return;
+    const lastEnd = day.segments.reduce((value, seg) => Math.max(value, examMinutes(seg.end)), 0);
+    const start = lastEnd || 9 * 60, end = Math.min(1440, start + (el.dataset.kind === 'break' ? 15 : 90));
+    day.segments.push({ kind: el.dataset.kind, subject: '', label: '', start: examTime(start), end: examTime(end) });
+    day.segments.sort((a, b) => examMinutes(a.start) - examMinutes(b.start));
+    mark(); render();
+  };
+  viewActions['exam-remove-seg'] = el => { draft.days[+el.dataset.day].segments.splice(+el.dataset.seg, 1); mark(); render(); };
+  viewActions['exam-fill-breaks'] = el => {
+    const day = draft.days[+el.dataset.day]; if (!day) return;
+    const exams = day.segments.filter(seg => seg.kind === 'exam').sort((a, b) => examMinutes(a.start) - examMinutes(b.start));
+    const breaks = [];
+    for (let index = 1; index < exams.length; index++) {
+      if (examMinutes(exams[index - 1].end) < examMinutes(exams[index].start))
+        breaks.push({ kind: 'break', subject: '', label: '休息时间', start: exams[index - 1].end, end: exams[index].start });
+    }
+    day.segments = day.segments.filter(seg => seg.kind !== 'break').concat(breaks).sort((a, b) => examMinutes(a.start) - examMinutes(b.start));
+    mark(); render();
+  };
+  viewActions['exam-save'] = async el => {
+    el.disabled = true;
+    try {
+      const body = {
+        name: draft.name.trim(),
+        enabled: draft.enabled,
+        classIds: [...draft.classIds],
+        expectedRevision: revision,
+        schedule: {
+          enterMinutesBefore: draft.enterMinutesBefore,
+          showSeconds: draft.showSeconds,
+          days: draft.days.map(day => ({
+            date: day.date,
+            segments: day.segments.map(seg => ({
+              kind: seg.kind,
+              subject: seg.kind === 'exam' ? seg.subject.trim() : '',
+              startMinute: examMinutes(seg.start),
+              endMinute: examMinutes(seg.end),
+              label: seg.kind === 'break' ? (seg.label.trim() || '休息时间') : null
+            }))
+          }))
+        }
+      };
+      if (!body.name) throw new Error('请填写计划名称。');
+      if (!body.classIds.length) throw new Error('请选择考试班级。');
+      if (creating) await api('/api/admin/exam-plans', { method: 'POST', body });
+      else await api('/api/admin/exam-plans/' + id, { method: 'PUT', body });
+      dirty = false; toast('考试计划已保存'); navigate('exam');
+    } catch (err) { fail(err); }
+    finally { el.disabled = false; }
+  };
+
+  function bind() {
+    const name = $('#exam-name', page); if (name) name.oninput = () => { draft.name = name.value; mark(); };
+    const enter = $('#exam-enter', page);
+    if (enter) enter.oninput = () => { draft.enterMinutesBefore = Math.max(0, Math.min(120, Math.round(+enter.value || 0))); mark(); };
+    const seconds = $('#exam-seconds', page);
+    if (seconds) seconds.onchange = () => { draft.showSeconds = seconds.checked; mark(); };
+    const enabled = $('#exam-enabled', page); if (enabled) enabled.onchange = () => { draft.enabled = enabled.checked; mark(); };
+    $$('[data-exam-date]', page).forEach(input => input.onchange = () => {
+      const day = draft.days[+input.dataset.examDate]; if (day) { day.date = input.value; mark(); }
+    });
+    $$('[data-exam-group]', page).forEach(box => box.onchange = () => {
+      const section = sections.find(item => (item.group ? item.group.id : '') === box.dataset.examGroup);
+      (section ? section.classes : []).forEach(c => box.checked ? draft.classIds.add(c.id) : draft.classIds.delete(c.id));
+      mark(); render();
+    });
+    $$('[data-exam-class]', page).forEach(box => box.onchange = () => {
+      if (box.checked) draft.classIds.add(box.dataset.examClass); else draft.classIds.delete(box.dataset.examClass);
+      mark(); render();
+    });
+    $$('[data-exam-kind]', page).forEach(select => select.onchange = () => {
+      const [dayIndex, segIndex] = select.dataset.examKind.split(':').map(Number);
+      const seg = draft.days[dayIndex]?.segments[segIndex];
+      if (seg) { seg.kind = select.value; mark(); render(); }
+    });
+    $$('[data-exam-text]', page).forEach(input => input.oninput = () => {
+      const [dayIndex, segIndex] = input.dataset.examText.split(':').map(Number);
+      const seg = draft.days[dayIndex]?.segments[segIndex]; if (!seg) return;
+      if (seg.kind === 'exam') seg.subject = input.value; else seg.label = input.value;
+      mark();
+    });
+    $$('[data-exam-start]', page).forEach(input => input.onchange = () => {
+      const [dayIndex, segIndex] = input.dataset.examStart.split(':').map(Number);
+      const seg = draft.days[dayIndex]?.segments[segIndex]; if (seg) { seg.start = input.value; mark(); }
+    });
+    $$('[data-exam-end]', page).forEach(input => input.onchange = () => {
+      const [dayIndex, segIndex] = input.dataset.examEnd.split(':').map(Number);
+      const seg = draft.days[dayIndex]?.segments[segIndex]; if (seg) { seg.end = input.value; mark(); }
+    });
+  }
+
+  function render() {
+    page.innerHTML = show(html`<div class="exam-editor">
+      <div class="card"><div class="card-head"><h3>基本信息</h3></div><div class="card-body grid-2">
+        <label class="field"><span>计划名称</span><input class="input" id="exam-name" maxlength="60" placeholder="例如 期中考试" value="${draft.name}"></label>
+        <label class="field"><span>开考前提前进入（分钟）</span><input class="input" id="exam-enter" type="number" min="0" max="120" value="${draft.enterMinutesBefore}"></label>
+        <label class="row" style="grid-column:1/-1"><input type="checkbox" id="exam-seconds" ${draft.showSeconds ? 'checked' : ''}><span>大时钟与倒计时显示到秒</span></label>
+        <label class="row" style="grid-column:1/-1"><input type="checkbox" id="exam-enabled" ${draft.enabled ? 'checked' : ''}><span>保存后启用（启用后按时间表自动全屏显示）</span></label>
+      </div></div>
+      <div class="card"><div class="card-head"><h3>参考班级</h3><span class="faint small">将影响 ${draft.classIds.size} 个班级</span></div><div class="card-body">
+        ${sections.length ? html`<div class="exam-classes">${sections.map(section => {
+          const groupId = section.group ? section.group.id : '';
+          const all = section.classes.length > 0 && section.classes.every(c => draft.classIds.has(c.id));
+          return html`<div class="exam-class-group">
+            <label class="row"><input type="checkbox" data-exam-group="${groupId}" ${all ? 'checked' : ''}><b>${section.group ? section.group.name : '未分组'}</b><span class="faint small">${section.classes.length} 个班</span></label>
+            <div class="exam-class-items">${section.classes.map(c => html`<label class="exam-class-item"><input type="checkbox" data-exam-class="${c.id}" ${draft.classIds.has(c.id) ? 'checked' : ''}><span>${c.name}</span></label>`)}</div>
+          </div>`;
+        })}</div>` : html`<p class="faint">没有可管理的班级。</p>`}
+      </div></div>
+      <div class="card"><div class="card-head"><h3>考试时间表</h3><span class="faint small">一天可以安排多场考试，场次之间可添加休息</span></div><div class="card-body">
+        ${draft.days.length ? draft.days.map((day, dayIndex) => html`<div class="exam-day">
+          <div class="row wrap">
+            <label class="field" style="width:180px"><span>考试日期</span><input class="input" type="date" data-exam-date="${dayIndex}" value="${day.date}"></label>
+            <span class="grow"></span>
+            <button class="btn sm danger" data-act="exam-remove-day" data-day="${dayIndex}">${icon('trash')}删除当天</button>
+          </div>
+          ${day.segments.length ? html`<div class="exam-segments">${day.segments.map((seg, segIndex) => html`<div class="exam-seg">
+            <select class="input sm" data-exam-kind="${dayIndex}:${segIndex}"><option value="exam" ${seg.kind === 'exam' ? 'selected' : ''}>考试</option><option value="break" ${seg.kind === 'break' ? 'selected' : ''}>休息</option></select>
+            <input class="input sm" data-exam-text="${dayIndex}:${segIndex}" maxlength="30" placeholder="${seg.kind === 'exam' ? '科目，如 语文' : '休息文案，如 课间休息'}" value="${seg.kind === 'exam' ? seg.subject : seg.label}">
+            <input class="input sm" type="time" data-exam-start="${dayIndex}:${segIndex}" value="${seg.start}">
+            <input class="input sm" type="time" data-exam-end="${dayIndex}:${segIndex}" value="${seg.end}">
+            <button class="btn sm ghost icon-only" data-act="exam-remove-seg" data-day="${dayIndex}" data-seg="${segIndex}" title="删除时间段">${icon('x')}</button>
+          </div>`)}</div>` : html`<p class="faint small">还没有时间段，先添加一场考试。</p>`}
+          <div class="row wrap" style="margin-top:10px">
+            <button class="btn sm" data-act="exam-add-seg" data-day="${dayIndex}" data-kind="exam">${icon('plus')}添加场次</button>
+            <button class="btn sm" data-act="exam-add-seg" data-day="${dayIndex}" data-kind="break">${icon('plus')}添加休息</button>
+            <button class="btn sm" data-act="exam-fill-breaks" data-day="${dayIndex}">自动填充休息</button>
+          </div>
+        </div>`) : html`<p class="faint">还没有考试日，点击下方按钮添加。</p>`}
+        <div class="row" style="margin-top:12px"><button class="btn" data-act="exam-add-day">${icon('plus')}添加考试日</button></div>
+      </div></div>
+    </div>`);
+    bind();
+  }
+
+  render();
 }
 
 async function viewClass(classId, section = 'homework', sub, query) {

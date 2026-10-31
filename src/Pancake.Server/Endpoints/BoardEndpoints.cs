@@ -191,7 +191,7 @@ public static class BoardEndpoints
 
     private static int LevelRank(string level) => level == "urgent" ? 0 : level == "important" ? 1 : 2;
 
-    private static async Task<Dictionary<Guid, string>> ManageableClasses(PancakeDbContext db, UserSession session)
+    internal static async Task<Dictionary<Guid, string>> ManageableClasses(PancakeDbContext db, UserSession session)
     {
         var query = db.Classes.Where(x => !x.Deleted);
         if (session.Role != PancakeRole.Administrator) query = query.Where(x => db.Memberships.Any(m => m.ClassId == x.Id && m.UserId == session.UserId));

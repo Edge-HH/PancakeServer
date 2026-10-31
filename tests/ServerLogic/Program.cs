@@ -379,6 +379,68 @@ try
     var publicBoard = await Json(await anon.GetAsync($"/api/public/classes/{publicCode}/board"));
     Check(publicBoard["announcements"]!.AsArray().Count == 2 && publicBoard["duty"] is not null && publicBoard["deviceId"] is null, "公开页班务信息");
 
+    // ---------------------------------------------------------------- 考试模式
+    DateOnly examDate = DateOnly.FromDateTime(DateTime.Now);
+    var examSchedule = new ExamSchedulePayload(
+    [
+        new ExamDayDto(examDate,
+        [
+            new ExamSegmentDto(ExamSegmentKinds.Exam, "语文", 540, 630),
+            new ExamSegmentDto(ExamSegmentKinds.Break, "", 630, 645, "课间休息"),
+            new ExamSegmentDto(ExamSegmentKinds.Exam, "数学", 645, 735)
+        ])
+    ], 5);
+    var planCreated = await Json(await admin.PostAsJsonAsync("/api/admin/exam-plans",
+        new ExamPlanWriteRequest("期中考试", examSchedule, [classId, class2], true)));
+    Guid examPlanId = planCreated["id"]!.GetValue<Guid>();
+    long examRevision = planCreated["revision"]!.GetValue<long>();
+    Check(examRevision == 1 && planCreated["schedule"]!["days"]!.AsArray().Count == 1
+        && planCreated["schedule"]!["days"]![0]!["segments"]!.AsArray().Count == 3, "新建考试计划并保存时间表");
+    var planList = await Json(await admin.GetAsync("/api/admin/exam-plans"));
+    Check(planList.AsArray().Count == 1 && planList.AsArray()[0]!["classIds"]!.AsArray().Count == 2
+        && planList.AsArray()[0]!["dates"]!.AsArray().Single()!.GetValue<string>() == examDate.ToString("yyyy-MM-dd"), "考试计划列表包含日期与目标班级");
+
+    // 考场名按班级保存，随考试安排下发
+    await Json(await admin.PutAsJsonAsync("/api/admin/exam-rooms", new ExamRoomWriteRequest([new ExamRoomItem(classId, "第 1 考场"), new ExamRoomItem(class2, "第 2 考场")])));
+    var roomList = await Json(await admin.GetAsync("/api/admin/exam-rooms"));
+    Check(roomList.AsArray().Any(x => x!["classId"]!.GetValue<Guid>() == classId && x["room"]!.GetValue<string>() == "第 1 考场"), "考场名按班级保存");
+    await Json(await math.PutAsJsonAsync("/api/admin/exam-rooms", new ExamRoomWriteRequest([new ExamRoomItem(class2, "越权")])), HttpStatusCode.Forbidden);
+
+    var deviceExam = (await Json(await device.GetAsync($"/api/classes/{classId}/exam"))).Deserialize<ExamScheduleDto>(web)!;
+    Check(deviceExam.PlanId == examPlanId && deviceExam.PlanName == "期中考试" && deviceExam.Days.Single().Segments.Count == 3
+        && Math.Abs((deviceExam.ServerTime - DateTime.UtcNow).TotalSeconds) < 30, "大屏拉到本班考试安排与服务器时间");
+    Check(deviceExam.Days[0].Segments[1] is { Kind: ExamSegmentKinds.Break, Label: "课间休息" }, "休息段文案");
+    Check(deviceExam.RoomName == "第 1 考场" && deviceExam.ShowSeconds, "考试安排带考场名与显示到秒的默认值");
+    Check((await anon.GetAsync($"/api/classes/{classId}/exam")).StatusCode == HttpStatusCode.Forbidden, "未授权不能读取考试安排");
+
+    // 修改计划：名称、目标班级与秒级显示都变化，关联行按差量更新
+    var updatedPlan = await Json(await admin.PutAsJsonAsync($"/api/admin/exam-plans/{examPlanId}",
+        new ExamPlanWriteRequest("期中考试（修订）", examSchedule with { ShowSeconds = false }, [classId], true, examRevision)));
+    Check(updatedPlan["name"]!.GetValue<string>() == "期中考试（修订）" && updatedPlan["revision"]!.GetValue<long>() == examRevision + 1
+        && updatedPlan["classIds"]!.AsArray().Count == 1 && updatedPlan["schedule"]!["showSeconds"]!.GetValue<bool>() == false,
+        "修改考试计划的名称、目标班级与显示到秒设置");
+    examRevision = updatedPlan["revision"]!.GetValue<long>();
+
+    // 校验：重叠、缺科目、结束不晚于开始、整天没有考试、空名称
+    async Task<HttpStatusCode> BadPlan(ExamSchedulePayload schedule, string name = "坏计划") =>
+        (await admin.PostAsJsonAsync("/api/admin/exam-plans", new ExamPlanWriteRequest(name, schedule, [classId], false))).StatusCode;
+    Check(await BadPlan(new ExamSchedulePayload([new ExamDayDto(examDate,
+        [new ExamSegmentDto(ExamSegmentKinds.Exam, "语文", 540, 630), new ExamSegmentDto(ExamSegmentKinds.Exam, "数学", 600, 660)])])) == HttpStatusCode.BadRequest, "时间段重叠被拒绝");
+    Check(await BadPlan(new ExamSchedulePayload([new ExamDayDto(examDate, [new ExamSegmentDto(ExamSegmentKinds.Exam, " ", 540, 630)])])) == HttpStatusCode.BadRequest, "考试科目不能为空");
+    Check(await BadPlan(new ExamSchedulePayload([new ExamDayDto(examDate, [new ExamSegmentDto(ExamSegmentKinds.Exam, "语文", 630, 630)])])) == HttpStatusCode.BadRequest, "结束时间必须晚于开始");
+    Check(await BadPlan(new ExamSchedulePayload([new ExamDayDto(examDate, [new ExamSegmentDto(ExamSegmentKinds.Break, "", 540, 630)])])) == HttpStatusCode.BadRequest, "每天至少一场考试");
+    Check(await BadPlan(examSchedule, "") == HttpStatusCode.BadRequest, "计划名称不能为空");
+
+    // 启用冲突、版本冲突与权限：老师只能管理自己班级的计划
+    Check((await admin.PostAsJsonAsync("/api/admin/exam-plans", new ExamPlanWriteRequest("冲突计划", examSchedule, [classId], true))).StatusCode == HttpStatusCode.Conflict, "同班同日不能有两个启用计划");
+    await Json(await admin.PutAsJsonAsync($"/api/admin/exam-plans/{examPlanId}", new ExamPlanWriteRequest("期中考试", examSchedule, [classId, class2], true, 99)), HttpStatusCode.Conflict);
+    var plan2 = await Json(await admin.PostAsJsonAsync("/api/admin/exam-plans",
+        new ExamPlanWriteRequest("明日补考", new ExamSchedulePayload([new ExamDayDto(examDate.AddDays(1), [new ExamSegmentDto(ExamSegmentKinds.Exam, "英语", 540, 630)])], 10), [class2], true)));
+    Guid examPlanId2 = plan2["id"]!.GetValue<Guid>();
+    Check((await Json(await math.GetAsync("/api/admin/exam-plans"))).AsArray().Count == 1, "老师只看到自己管理班级的考试计划");
+    await Json(await math.GetAsync($"/api/admin/exam-plans/{examPlanId2}"), HttpStatusCode.Forbidden);
+    await Json(await math.PostAsJsonAsync("/api/admin/exam-plans", new ExamPlanWriteRequest("越权", examSchedule, [class2], true)), HttpStatusCode.Forbidden);
+
     // 设备状态、实时连接与远程指令
     await Json(await device.PostAsJsonAsync($"/api/classes/{classId}/devices/me/status", new DeviceStatusRequest("3.0.0", 2, "上传失败", projectId, "10月8日")));
     var offline = await Json(await admin.PostAsJsonAsync($"/api/classes/{classId}/devices/{paired.DeviceId}/command", new DeviceCommandRequest("sync", null)));
@@ -486,6 +548,11 @@ try
         await Json(await device.PutAsJsonAsync($"/api/classes/{classId}/devices/me/screen", screen with { Width = -1 }), HttpStatusCode.BadRequest);
         await Json(await device.PutAsJsonAsync($"/api/classes/{classId}/devices/me/screen", screen with { LayoutMode = "Grid" }), HttpStatusCode.BadRequest);
 
+        // 考试计划的启停实时推送给大屏
+        await Json(await admin.PatchAsJsonAsync($"/api/admin/exam-plans/{examPlanId}/enabled", new ExamEnabledRequest(false, examRevision)));
+        var examEvent = await Next(boardSocket, e => e.Type == SyncEventTypes.Exam);
+        Check(examEvent.ClassId == classId && examEvent.Revision == examRevision + 1, "停用考试计划时大屏收到 exam 通知");
+
         // 用一条项目通知收尾：大屏和公开页在它之前不应收到 editing 或 screen
         await Json(await admin.PatchAsJsonAsync($"/api/classes/{classId}/projects/{projectId}", new ProjectPatchRequest("10月8日", today)));
         List<SyncEvent> boardSeen = [], publicSeen = [];
@@ -493,6 +560,14 @@ try
         await Next(publicSocket, e => e.Type == SyncEventTypes.Updated, publicSeen);
         Check(boardSeen.Concat(publicSeen).All(e => e.Type is not (SyncEventTypes.Editing or SyncEventTypes.Screen)), "大屏和公开页收不到编辑占用与屏幕通知");
     }
+
+    // 停用后大屏不再拿到考试安排；重新启用恢复；删除后彻底消失
+    Check((await device.GetAsync($"/api/classes/{classId}/exam")).StatusCode == HttpStatusCode.NoContent, "停用的考试计划不再下发给大屏");
+    await Json(await admin.PatchAsJsonAsync($"/api/admin/exam-plans/{examPlanId}/enabled", new ExamEnabledRequest(true, examRevision + 1)));
+    Check((await device.GetAsync($"/api/classes/{classId}/exam")).StatusCode == HttpStatusCode.OK, "重新启用后大屏恢复考试安排");
+    await Json(await admin.DeleteAsync($"/api/admin/exam-plans/{examPlanId}"), HttpStatusCode.NoContent);
+    await Json(await admin.DeleteAsync($"/api/admin/exam-plans/{examPlanId2}"), HttpStatusCode.NoContent);
+    Check((await Json(await admin.GetAsync("/api/admin/exam-plans"))).AsArray().Count == 0, "删除考试计划");
 
     // 项目配色：随项目保存；受科目限制的老师不能改；不再作为班级设置同步
     long schemeRevision = (await Json(await admin.GetAsync($"/api/classes/{classId}/projects/{projectId}")))["revision"]!.GetValue<long>();
