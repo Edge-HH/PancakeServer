@@ -3,19 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<title>Pancake 集控</title>
+<meta name="color-scheme" content="light">
+<title>Pancake 作业</title>
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="app.css">
-<script>
-  // 在样式加载前确定主题，避免深色模式下闪白。
-  (function () {
-    var t = 'system';
-    try { t = localStorage.getItem('pancake.theme') || 'system'; } catch (e) {}
-    var dark = t === 'dark' || (t === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
-    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-  })();
-</script>
 </head>
 <body>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">

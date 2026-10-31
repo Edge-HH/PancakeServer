@@ -132,11 +132,27 @@ public static class BoardEndpoints
             device.PendingChanges = Math.Clamp(request.PendingChanges, 0, 100000);
             device.LastError = Clip(request.LastError, 300);
             device.ActiveProject = Clip(request.ActiveProjectName, 80);
+            device.ActiveProjectId = request.ActiveProjectId;
             if (request.Fonts is { } fonts)
                 device.FontsJson = System.Text.Json.JsonSerializer.Serialize(fonts.Where(f => !string.IsNullOrWhiteSpace(f) && f.Length <= 100).Select(f => f.Trim()).Distinct().Take(2000).ToList());
             device.LastSyncAt = DateTime.UtcNow; device.LastSeenAt = DateTime.UtcNow;
             await db.SaveChangesAsync();
             return Results.Ok(new { deviceId = device.Id, deviceName = device.DeviceName });
+        });
+
+        // 大屏的屏幕与分区：窗口、布局或缩放变化后上报，网页据此按真实尺寸画出整屏和各区域。只有内容变了才写库并通知网页。
+        app.MapPut("/api/classes/{classId:guid}/devices/me/screen", async (HttpRequest http, Guid classId, DeviceScreenReport request, PancakeDbContext db, ClassSocketHub hub) =>
+        {
+            if (await Access.Device(http, classId, db) is not { } device) return Results.Unauthorized();
+            if (CleanScreen(request) is not { } screen) return Results.BadRequest("屏幕信息无效。");
+            string json = System.Text.Json.JsonSerializer.Serialize(screen, ScreenJson);
+            if (json == device.ScreenJson) return Results.NoContent();
+            device.ScreenJson = json;
+            device.ScreenAt = DateTime.UtcNow;
+            if (screen.ActiveProjectId is { } active) device.ActiveProjectId = active;
+            await db.SaveChangesAsync();
+            await hub.PublishToUsersAsync(new SyncEvent(classId, Guid.Empty, 0, SyncEventTypes.Screen, device.Id, Screen: screen), CancellationToken.None);
+            return Results.NoContent();
         });
 
         app.MapPost("/api/classes/{classId:guid}/devices/{deviceId:guid}/command", async (HttpRequest http, Guid classId, Guid deviceId, DeviceCommandRequest request, PancakeDbContext db, SessionStore sessions, ClassSocketHub hub) =>
@@ -202,6 +218,28 @@ public static class BoardEndpoints
     }
 
     private static string Clip(string? value, int max) { string v = (value ?? "").Trim(); return v.Length > max ? v[..max] : v; }
+
+    public static readonly System.Text.Json.JsonSerializerOptions ScreenJson = new(System.Text.Json.JsonSerializerDefaults.Web);
+    private static readonly string[] LayoutModes = ["Split", "Board", "Clock", "Free"];
+
+    /// <summary>屏幕上报：尺寸有限且不超过 20000，区域在合理范围内，数值保留一位小数；不合法时返回 null。</summary>
+    private static DeviceScreenReport? CleanScreen(DeviceScreenReport? report)
+    {
+        static double? Round(double value, double min, double max) => double.IsFinite(value) && value >= min && value <= max ? Math.Round(value, 1) : null;
+        static ScreenRegion? Region(ScreenRegion? r, out bool bad)
+        {
+            bad = false;
+            if (r is null) return null;
+            if (Round(r.X, -20000, 20000) is not { } x || Round(r.Y, -20000, 20000) is not { } y || Round(r.Width, 0, 20000) is not { } w || Round(r.Height, 0, 20000) is not { } h) { bad = true; return null; }
+            return new ScreenRegion(x, y, w, h);
+        }
+        if (report is null || !LayoutModes.Contains(report.LayoutMode)) return null;
+        if (Round(report.Width, 1, 20000) is not { } width || Round(report.Height, 1, 20000) is not { } height) return null;
+        if (!double.IsFinite(report.Scale) || report.Scale is <= 0 or > 10 || !double.IsFinite(report.SplitRatio) || report.SplitRatio is < 0 or > 1) return null;
+        ScreenRegion? clock = Region(report.Clock, out bool badClock), board = Region(report.Board, out bool badBoard);
+        if (badClock || badBoard) return null;
+        return new DeviceScreenReport(width, height, Math.Round(report.Scale, 3), report.LayoutMode, Math.Round(report.SplitRatio, 4), report.Compact, clock, board, report.ActiveProjectId);
+    }
 
     private static AnnouncementItem ToItem(Announcement x) => new(x.Id, x.Title, x.Body, x.Level, x.Pinned, x.CreatedAt, x.StartsAt, x.ExpiresAt, x.Author);
 

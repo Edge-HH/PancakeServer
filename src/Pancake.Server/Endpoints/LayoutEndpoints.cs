@@ -67,7 +67,7 @@ public static class LayoutEndpoints
             foreach (var (key, element) in request.Set ?? [])
                 set[key] = JsonNode.Parse(element.GetRawText());
             JsonObject clean = SettingsSchema.Sanitize(set);
-            List<string> unset = (request.Unset ?? []).Where(k => SettingsSchema.Find(k) is not null && !clean.ContainsKey(k)).Distinct().ToList();
+            List<string> unset = (request.Unset ?? []).Where(k => SettingsSchema.IsSynced(k) && !clean.ContainsKey(k)).Distinct().ToList();
             if (clean.Count == 0 && unset.Count == 0 && set.Count > 0) return Results.BadRequest("没有可识别的设置。");
 
             List<string> conflicts = [];

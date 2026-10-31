@@ -13,10 +13,14 @@ public sealed record ProjectRevisionItem(long Revision, string Name, DateOnly? D
 public sealed record ProjectPatchRequest(string? Name, DateOnly? Date, bool ClearDate = false);
 public sealed record RestoreRequest(long? Revision);
 
-public sealed record ClassDetail(Guid Id, string Name, string PublicCode, DateTime CreatedAt, int ProjectCount, int DeviceCount, int TeacherCount, DateTime? LastUpdatedAt, int Online);
+/// <summary>Online 是保持实时连接的大屏数量（老师网页与公开页不算）。</summary>
+public sealed record ClassDetail(Guid Id, string Name, string PublicCode, DateTime CreatedAt, int ProjectCount, int DeviceCount, int TeacherCount, DateTime? LastUpdatedAt, int Online,
+    Guid? GroupId = null, string? GroupName = null);
 public sealed record RenameRequest(string Name);
+/// <summary>Screen 是大屏最近上报的屏幕与分区，ScreenAt 为它最后一次变化的时间。</summary>
 public sealed record DeviceItem(Guid Id, string DeviceName, DateTime CreatedAt, DateTime? LastSeenAt, bool Revoked,
-    string AppVersion, DateTime? LastSyncAt, int PendingChanges, string LastError, string ActiveProject, bool Online);
+    string AppVersion, DateTime? LastSyncAt, int PendingChanges, string LastError, string ActiveProject, bool Online,
+    Guid? ActiveProjectId = null, Pancake.Shared.DeviceScreenReport? Screen = null, DateTime? ScreenAt = null);
 public sealed record DeviceCommandRequest(string Command, string? Text);
 
 public sealed record UserItem(Guid Id, string UserName, string DisplayName, string Role, bool Enabled, DateTime? CreatedAt, DateTime? LastLoginAt, List<ClassRef> Classes);
@@ -33,9 +37,20 @@ public sealed record EntryEdit(int? Index, string Content, List<AttachmentEdit>?
 public sealed record SubjectRect(double X, double Y, double Width, double Height);
 /// <summary>Rect 为磁贴位置与大小（为空保持不变）；FollowPalette 为 true 时科目颜色跟随色系。</summary>
 public sealed record SubjectEdit(int? Index, string Name, string? AccentHex, List<EntryEdit>? Entries, SubjectRect? Rect = null, bool? FollowPalette = null);
-public sealed record HomeworkEditRequest(long ExpectedRevision, List<SubjectEdit> Subjects);
+/// <summary>Theme（Dark / Light / Default）与 Palette（Vivid / Macaron）是项目配色，为空保持不变。</summary>
+public sealed record HomeworkEditRequest(long ExpectedRevision, List<SubjectEdit> Subjects, string? Theme = null, string? Palette = null);
 /// <summary>TemplateProjectId 为空且 UseLatestTemplate 时沿用最近一个项目的科目布局。</summary>
 public sealed record CreateProjectRequest(string Name, DateOnly? Date, Guid? TemplateProjectId, bool UseLatestTemplate = true);
+/// <summary>把作业复制到其他班级同一天的项目；Subjects 为空表示复制全部有内容的科目。</summary>
+public sealed record CopyHomeworkRequest(List<Guid> ClassIds, List<string>? Subjects);
+/// <summary>每个目标班级的结果：Copied 为写入的科目，Skipped 为没有权限改动而跳过的科目；Error 不为空表示整个班级被跳过。</summary>
+public sealed record CopyHomeworkItem(Guid ClassId, string ClassName, Guid? ProjectId, bool Created, List<string> Copied, List<string> Skipped, string? Error);
+
+// ---------- 班级分组
+public sealed record ClassGroupItem(Guid Id, string Name, int SortOrder, int ClassCount);
+public sealed record ClassGroupWriteRequest(string Name);
+public sealed record ClassGroupOrderRequest(List<Guid> Ids);
+public sealed record ClassGroupAssignRequest(Guid? GroupId);
 
 // ---------- 布局
 public sealed record LayoutPolicyRequest(string Policy);

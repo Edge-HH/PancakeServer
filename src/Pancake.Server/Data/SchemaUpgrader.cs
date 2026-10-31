@@ -25,6 +25,15 @@ public static class SchemaUpgrader
         AddColumn(db, "Devices", "LastError", "TEXT NOT NULL DEFAULT ''");
         AddColumn(db, "Devices", "ActiveProject", "TEXT NOT NULL DEFAULT ''");
         AddColumn(db, "Devices", "FontsJson", "TEXT NOT NULL DEFAULT '[]'");
+        AddColumn(db, "Devices", "ActiveProjectId", "TEXT NULL");
+        AddColumn(db, "Devices", "ScreenJson", "TEXT NOT NULL DEFAULT ''");
+        AddColumn(db, "Devices", "ScreenAt", "TEXT NULL");
+        AddColumn(db, "Classes", "GroupId", "TEXT NULL");
+        db.Database.ExecuteSqlRaw("""
+            CREATE TABLE IF NOT EXISTS "ClassGroups" (
+                "Id" TEXT NOT NULL CONSTRAINT "PK_ClassGroups" PRIMARY KEY,
+                "Name" TEXT NOT NULL, "SortOrder" INTEGER NOT NULL, "CreatedAt" TEXT NOT NULL);
+            """);
 
         db.Database.ExecuteSqlRaw("""
             CREATE TABLE IF NOT EXISTS "ProjectRevisions" (

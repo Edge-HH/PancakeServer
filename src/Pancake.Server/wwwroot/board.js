@@ -28,6 +28,18 @@ const Board = (() => {
   }
   const isPreset = hex => typeof hex === 'string' && (VIVID.includes(hex.toUpperCase()) || MACARON.includes(hex.toUpperCase()));
   const accent = (hex, explicit, macaron) => explicit && !isPreset(hex) ? hex : palette(hex, macaron);
+  /** 预设色的序号；鲜艳与马卡龙同序号是同一种颜色，自定义颜色返回 -1。 */
+  const presetIndex = hex => { const up = String(hex || '').toUpperCase(), i = VIVID.indexOf(up); return i >= 0 ? i : MACARON.indexOf(up); };
+
+  /**
+   * 色卡，按色系解析，与大屏编辑时的色卡一致（Controls/SubjectTileControl.cs）：磁贴主题色取预设前 7 个，
+   * 文字颜色 5 个，高光多一个浅白。套用时写入解析后的色值，和大屏一样。
+   */
+  const TEXT_PRESETS = ['#FBBF24', '#F87171', '#60A5FA', '#4ADE80', '#F472B6'];
+  function swatches(macaron) {
+    const map = list => list.map(c => palette(c, macaron));
+    return { tile: map(VIVID.slice(0, 7)), text: map(TEXT_PRESETS), highlight: ['#F7F7F9', ...map(TEXT_PRESETS)] };
+  }
 
   /** #AARRGGBB / #RRGGBB → [r,g,b,a(0-1)]。 */
   function rgba(hex, fallback) {
@@ -94,12 +106,9 @@ const Board = (() => {
     if (r.fontFamily) s.push(`font-family:${fontStack(r.fontFamily)}`);
     // RichEdit 的字号以磅保存，显示为 DIP 需乘 4/3。
     if (r.fontSize) s.push(`font-size:${(r.fontSize * 4 / 3).toFixed(2)}px`);
-    if (r.color) {
-      let c = palette(r.color, t.macaron);
-      if (t.light && DEFAULT_WHITE.includes(String(c).toUpperCase())) c = t.text;
-      s.push(`color:${c}`);
-    }
-    if (r.highlight) s.push(`background:${palette(r.highlight, t.macaron)}`);
+    // 文字颜色与高光按保存的色值显示：大屏切换色系时不改已设置的颜色，只有默认白字在浅色主题下显示为黑字。
+    if (r.color) s.push(`color:${t.light && DEFAULT_WHITE.includes(String(r.color).toUpperCase()) ? t.text : r.color}`);
+    if (r.highlight) s.push(`background:${r.highlight}`);
     return s.join(';');
   }
   const fontStack = f => `${JSON.stringify(String(f)).replace(/"/g, "'")},'HarmonyOS Sans SC',sans-serif`;
@@ -124,7 +133,7 @@ const Board = (() => {
         <div class="pk-title" style="font-size:${+doc.TileTitleSize || 29}px;max-width:${Math.max(240, subject.w - 150)}px">${esc(subject.name)}</div>
         <div class="pk-entries">${rows}</div>
       </div>
-      ${ctx.grip ? '<div class="pk-grip" data-grip></div>' : ''}
+      ${ctx.grip ? ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'].map(direction => `<div class="pk-grip pk-grip-${direction}" data-grip="${direction}"></div>`).join('') : ''}
     </div>`;
   }
 
@@ -213,29 +222,44 @@ const Board = (() => {
   const sharedOn = d => (d.LayoutMode || 'Split') === 'Split' && !!d.SharedBackgroundEnabled;
 
   /**
-   * 整屏：W×H 的大屏，按布局模式分出时钟区与作业板，磁贴按大屏坐标摆放，控制窗按位置和边距停靠。
-   * opts = { tiles, editing, interactive, assetUrl }；tiles 的坐标单位与大屏作业板一致。
+   * 按布局模式和分屏比例从整屏尺寸算出时钟区与作业区（大屏没有上报真实分区时使用）。
+   * 返回 { mode, compact, clock, board }，区域为 { x, y, w, h }，不显示的区域为 null。
+   */
+  function regions(doc, W, H) {
+    const mode = doc.LayoutMode || 'Split', all = { x: 0, y: 0, w: W, h: H };
+    if (mode === 'Free' || mode === 'Board') return { mode, compact: false, clock: null, board: all };
+    if (mode === 'Clock') return { mode, compact: false, clock: all, board: null };
+    const cw = Math.round(W * SPLIT(doc));
+    return { mode, compact: false, clock: { x: 0, y: 0, w: cw, h: H }, board: { x: cw, y: 0, w: W - cw, h: H } };
+  }
+
+  /**
+   * 整屏：W×H 的大屏，分出时钟区与作业区，磁贴按作业区坐标摆放，控制窗按位置和边距停靠。
+   * opts = { tiles, editing, interactive, assetUrl, regions, splitHandle, labels }：regions 为大屏上报的真实分区（缺省按比例计算，
+   * 窄屏时两区上下排列）；splitHandle 显示可拖动的分隔条；labels 在各区域角上标出尺寸。tiles 的坐标单位与大屏作业区一致。
    */
   function screen(doc, t, W, H, opts = {}) {
-    const mode = doc.LayoutMode || 'Split', ratio = SPLIT(doc), shared = sharedOn(doc), ctx = { assetUrl: opts.assetUrl };
-    const clockW = mode === 'Split' ? Math.round(W * ratio) : mode === 'Clock' ? W : 0;
-    const boardX = mode === 'Split' ? clockW : 0, boardW = mode === 'Clock' ? 0 : W - boardX;
+    const geo = opts.regions || regions(doc, W, H), mode = geo.mode, shared = sharedOn(doc), ctx = { assetUrl: opts.assetUrl };
     const tiles = opts.tiles || [];
     const tileHtml = tiles.map((s, i) => tile(s, doc, t, { ...ctx, x: s.x, y: s.y, grip: opts.interactive && !s.locked, cls: s.cls, attrs: `data-tile="${i}"` })).join('');
-    const region = (x, w, inner, bg) => `<div class="pk-region" style="left:${x}px;width:${w}px">${bg}${inner}</div>`;
+    const size = (name, r) => opts.labels && r ? `<div class="pk-size">${name} ${Math.round(r.w)} × ${Math.round(r.h)}</div>` : '';
+    const region = (r, part, inner, bg) => `<div class="pk-region" data-region="${part}" style="left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px">${bg}${inner}${size(part === 'clock' ? '时钟区' : '作业区', r)}</div>`;
     let body = '';
     if (mode === 'Free') {
       // 自由布局：整屏是作业板，时钟、天气与噪音组件按整屏坐标摆放。
-      const wd = doc.Widgets || {};
+      const wd = doc.Widgets || {}, board = geo.board || { x: 0, y: 0, w: W, h: H };
       const free = [['Clock', clock(doc, t)], ['Weather', weatherCard(doc, t)], ['Noise', noiseCard(doc, t)]]
         .filter(([k]) => wd[k]).map(([k, h]) => `<div class="pk-fit pk-free" data-widget="${k}" style="left:${wd[k].X}px;top:${wd[k].Y}px;width:${Math.max(20, wd[k].Width)}px;height:${Math.max(20, wd[k].Height)}px"><div class="pk-fit-inner">${h}</div></div>`).join('');
-      body = region(0, W, `${grid(doc, effectiveGrid(doc, opts.editing), W, H)}<div class="pk-layer">${tileHtml}</div>${free}`, `<div class="pk-fill" style="background:${t.surface}"></div>`);
+      body = region(board, 'board', `${grid(doc, effectiveGrid(doc, opts.editing), board.w, board.h)}<div class="pk-layer">${tileHtml}</div>`, `<div class="pk-fill" style="background:${t.surface}"></div>`) + free;
     } else {
-      if (clockW) body += region(0, clockW, `<div class="pk-dock" data-dock="${mode === 'Split' ? 'Split' : 'ClockMode'}"><div class="pk-fit" data-part="Clock"><div class="pk-fit-inner">${clock(doc, t)}</div></div><div class="pk-fit" data-part="Components"><div class="pk-fit-inner">${components(doc, t)}</div></div></div>`,
+      if (geo.clock) body += region(geo.clock, 'clock', `<div class="pk-dock" data-dock="${mode === 'Split' ? 'Split' : 'ClockMode'}"><div class="pk-fit" data-part="Clock"><div class="pk-fit-inner">${clock(doc, t)}</div></div><div class="pk-fit" data-part="Components"><div class="pk-fit-inner">${components(doc, t)}</div></div></div>`,
         background(doc.ClockBackground, t, { ...ctx, shared }));
-      if (mode !== 'Clock') body += region(boardX, boardW, `${grid(doc, effectiveGrid(doc, opts.editing), boardW, H)}<div class="pk-layer">${tileHtml || (opts.placeholder ?? '')}</div>`,
+      if (geo.board) body += region(geo.board, 'board', `${grid(doc, effectiveGrid(doc, opts.editing), geo.board.w, geo.board.h)}<div class="pk-layer">${tileHtml || (opts.placeholder ?? '')}</div>`,
         background(doc.BoardBackground, t, { ...ctx, shared }));
-      if (mode === 'Split') body += `<div class="pk-divider" style="left:${clockW - .5}px;background:${t.line}"></div>${opts.interactive ? `<div class="pk-split" data-split style="left:${clockW - 14}px"></div>` : ''}`;
+      if (geo.clock && geo.board)
+        body += geo.compact
+          ? `<div class="pk-divider pk-divider-h" style="top:${geo.board.y - .5}px;background:${t.line}"></div>`
+          : `<div class="pk-divider" style="left:${geo.board.x - .5}px;background:${t.line}"></div>${opts.splitHandle ? `<div class="pk-split" data-split style="left:${geo.board.x - 14}px" title="拖动调整分屏比例"></div>` : ''}`;
     }
     return `<div class="pk-scene" style="width:${W}px;height:${H}px;${vars(t)}">
       ${shared && mode === 'Split' ? background(doc.SharedBackground, t, ctx) : `<div class="pk-fill" style="background:${t.surface}"></div>`}
@@ -339,5 +363,5 @@ const Board = (() => {
   // 字体加载完成后宽度会变，停靠与等比缩放需要重新计算。
   const fontsReady = document.fonts ? document.fonts.ready : Promise.resolve();
 
-  return { theme, palette, accent, tile, sampleTile, clock, components, toolbar, toolbarRect, grid, screen, sample, background, mount, fit, dock, fontsReady, SPLIT };
+  return { theme, palette, accent, presetIndex, swatches, tile, sampleTile, clock, components, toolbar, toolbarRect, grid, regions, screen, sample, background, mount, fit, dock, fontsReady, SPLIT };
 })();

@@ -106,7 +106,7 @@ public static class SettingsSchema
 
         // 外观 → 主题
         new("Theme", "AppearanceTheme", "主题", SettingKind.Enum, "Dark", Options: [new("Dark", "深色"), new("Light", "浅色"), new("Default", "跟随系统")], Hint: "深色更接近教室黑板，强光环境可切换浅色。"),
-        new("Palette", "AppearanceTheme", "色系", SettingKind.Enum, "Vivid", Options: [new("Vivid", "鲜艳"), new("Macaron", "马卡龙")], Hint: "磁贴主题色与高光色按色系一一对应切换。"),
+        new("Palette", "AppearanceTheme", "色系", SettingKind.Enum, "Vivid", Options: [new("Vivid", "鲜艳"), new("Macaron", "马卡龙")], Hint: "磁贴主题色按色系一一对应切换；已设置的文字颜色与高光保持不变。"),
 
         // 外观 → 网格
         new("GridStyle", "AppearanceGrid", "样式", SettingKind.Enum, "Grid", Options: [new("Grid", "网格"), new("Dots", "点阵"), new("None", "不显示")]),
@@ -195,11 +195,24 @@ public static class SettingsSchema
         ["Autofill.Homework.Blocked"] = "本机补全屏蔽词"
     };
 
+    /// <summary>
+    /// 随作业项目保存的设置：每个项目有自己的主题与色系，大屏切换项目时跟着换，网页在编辑项目时修改。
+    /// 它们仍登记在 All 里（设置页照常显示），但不作为班级设置同步：同步键、校验与差异比较都跳过它们。
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, string> ProjectScopedKeys = new Dictionary<string, string>
+    {
+        ["Theme"] = "随作业项目保存",
+        ["Palette"] = "随作业项目保存"
+    };
+
     private static readonly Dictionary<string, SettingDescriptor> ByKey = All.ToDictionary(x => x.Key, StringComparer.Ordinal);
 
     public static SettingDescriptor? Find(string key) => ByKey.GetValueOrDefault(key);
 
-    public static IEnumerable<string> Keys => All.Select(x => x.Key);
+    /// <summary>作为班级设置同步的键：已登记且不随项目保存。</summary>
+    public static bool IsSynced(string key) => ByKey.ContainsKey(key) && !ProjectScopedKeys.ContainsKey(key);
+
+    public static IEnumerable<string> Keys => All.Where(x => !ProjectScopedKeys.ContainsKey(x.Key)).Select(x => x.Key);
 
     public static IEnumerable<string> BackgroundKeys => All.Where(x => x.Kind == SettingKind.Background).Select(x => x.Key);
 
@@ -231,9 +244,9 @@ public static class SettingsSchema
 
     // ------------------------------------------------------------------ 比较
 
-    /// <summary>逐键比较两份扁平设置 JSON，返回值不同的已登记键（含一边缺失的键）。</summary>
+    /// <summary>逐键比较两份扁平设置 JSON，返回值不同的同步键（含一边缺失的键）。</summary>
     public static List<string> ChangedKeys(JsonObject from, JsonObject to) =>
-        All.Select(x => x.Key).Where(key => from.TryGetPropertyValue(key, out JsonNode? a) != to.TryGetPropertyValue(key, out JsonNode? b) || !Same(a, b)).ToList();
+        Keys.Where(key => from.TryGetPropertyValue(key, out JsonNode? a) != to.TryGetPropertyValue(key, out JsonNode? b) || !Same(a, b)).ToList();
 
     /// <summary>JSON 值语义相等：数字按数值比较（48 与 48.0 相同），对象不看键顺序。</summary>
     public static bool Same(JsonNode? a, JsonNode? b)
@@ -255,7 +268,7 @@ public static class SettingsSchema
     // ------------------------------------------------------------------ 校验
 
     /// <summary>
-    /// 校验一组扁平设置（键为描述符 Key）：丢弃未知键和类型不符的值，数字限幅并按步长取整，枚举只接受登记的取值。
+    /// 校验一组扁平设置（键为描述符 Key）：丢弃未知键、随项目保存的键和类型不符的值，数字限幅并按步长取整，枚举只接受登记的取值。
     /// 返回新对象，原对象不变。
     /// </summary>
     public static JsonObject Sanitize(JsonObject values)
@@ -263,7 +276,7 @@ public static class SettingsSchema
         JsonObject result = new();
         foreach (var (key, value) in values)
         {
-            if (Find(key) is not { } descriptor) continue;
+            if (!IsSynced(key) || Find(key) is not { } descriptor) continue;
             if (SanitizeValue(descriptor, value) is { } clean) result[key] = clean;
         }
         return result;

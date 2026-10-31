@@ -17,6 +17,7 @@ public sealed class PancakeDbContext(DbContextOptions<PancakeDbContext> options)
     public DbSet<Student> Students => Set<Student>();
     public DbSet<DutyPlan> DutyPlans => Set<DutyPlan>();
     public DbSet<Announcement> Announcements => Set<Announcement>();
+    public DbSet<ClassGroup> ClassGroups => Set<ClassGroup>();
 
     protected override void OnModelCreating(ModelBuilder model)
     {
@@ -64,6 +65,17 @@ public sealed class Classroom
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public bool Deleted { get; set; }
     public string LayoutPolicy { get; set; } = Pancake.Shared.LayoutPolicies.Shared;
+    /// <summary>所属的班级分组；为空表示未分组。</summary>
+    public Guid? GroupId { get; set; }
+}
+
+/// <summary>班级分组（年级、校区等）：网页按组归类显示班级，并可以把作业复制到同组的其他班级。</summary>
+public sealed class ClassGroup
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public string Name { get; set; } = "";
+    public int SortOrder { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }
 
 public sealed class ClassMembership
@@ -111,7 +123,11 @@ public sealed class DeviceRegistration
     public int PendingChanges { get; set; }
     public string LastError { get; set; } = "";
     public string ActiveProject { get; set; } = "";
+    public Guid? ActiveProjectId { get; set; }
     public string FontsJson { get; set; } = "[]";
+    /// <summary>最近一次上报的屏幕与分区（DeviceScreenReport 的 JSON）；ScreenAt 是它最后一次变化的时间。</summary>
+    public string ScreenJson { get; set; } = "";
+    public DateTime? ScreenAt { get; set; }
 }
 
 /// <summary>每次写入保存一份完整快照，用于在网页端查看历史和回滚。</summary>

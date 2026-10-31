@@ -17,12 +17,14 @@ public sealed record DevicePairRequest(string PairingCode, string DeviceName);
 public sealed record DevicePairResponse(string DeviceToken, Guid ClassId, DateTime ExpiresAt, string ClassName = "", Guid DeviceId = default);
 
 /// <summary>
-/// 班级实时通知。Type：updated / deleted（项目）、layout（班级布局）、board（公告与值日）、command（发给单台设备的指令）。
-/// SourceDeviceId 是触发这次修改的设备（网页修改时为空），设备据此忽略自己的回声；Keys 是布局通知里改动的设置键。
+/// 班级实时通知。Type：updated / deleted（项目）、layout（班级布局）、board（公告与值日）、command（发给单台设备的指令）、
+/// editing（项目编辑占用变化）、screen（大屏上报的屏幕与分区）。editing 与 screen 只发给老师的网页，大屏和公开页收不到。
+/// SourceDeviceId 是触发这次修改的设备（网页修改时为空），设备据此忽略自己的回声；Keys 是布局通知里改动的设置键；
+/// Lock 是 editing 通知里的当前占用（为空表示已释放）；Screen 是 screen 通知里的屏幕信息，DeviceId 为上报的设备。
 /// 旧客户端只认识前四个字段，新增字段都有默认值。
 /// </summary>
 public sealed record SyncEvent(Guid ClassId, Guid ProjectId, long Revision, string Type, Guid? DeviceId = null, string? Command = null, string? Text = null,
-    Guid? SourceDeviceId = null, List<string>? Keys = null);
+    Guid? SourceDeviceId = null, List<string>? Keys = null, EditLockInfo? Lock = null, DeviceScreenReport? Screen = null);
 
 public static class SyncEventTypes
 {
@@ -31,7 +33,46 @@ public static class SyncEventTypes
     public const string Layout = "layout";
     public const string Board = "board";
     public const string Command = "command";
+    public const string Editing = "editing";
+    public const string Screen = "screen";
 }
+
+/// <summary>
+/// 发给设备的指令（SyncEvent.Command）：message 显示 Text；open-project 切换到 ProjectId；
+/// end-edit 保存并退出 ProjectId 的编辑模式，Text 是请求编辑的老师；其余指令按“立即同步”处理。
+/// </summary>
+public static class DeviceCommands
+{
+    public const string Message = "message";
+    public const string Sync = "sync";
+    public const string OpenProject = "open-project";
+    public const string EndEdit = "end-edit";
+}
+
+/// <summary>
+/// 项目编辑占用：大屏进入编辑模式或网页开始修改时占用，期间另一端只能查看。Holder 为 device 或 user；
+/// 网页按页面区分（ClientId），同一位老师的两个窗口也互相占用。占用靠心跳续期，超过有效期没有续期即失效。
+/// </summary>
+public sealed record EditLockInfo(Guid ProjectId, string Holder, Guid? DeviceId, Guid? UserId, string? ClientId, string Name, DateTime Since);
+
+/// <summary>占用或续期。Force 只对老师有效：接管大屏的占用，大屏随后保存并退出编辑。</summary>
+public sealed record EditLockRequest(string? ClientId = null, bool Force = false);
+
+public static class EditLockHolders
+{
+    public const string Device = "device";
+    public const string User = "user";
+}
+
+/// <summary>屏幕上的一块区域，单位与磁贴坐标相同（DIP），相对整个显示区域的左上角。</summary>
+public sealed record ScreenRegion(double X, double Y, double Width, double Height);
+
+/// <summary>
+/// 大屏当前的显示区域：整屏尺寸（DIP）、缩放比例、布局模式与分屏比例，以及时钟区和作业区的实际位置与大小。
+/// Compact 为窗口过窄时时钟区与作业区上下排列；某个区域不显示时为空。窗口、布局或缩放变化后重新上报。
+/// </summary>
+public sealed record DeviceScreenReport(double Width, double Height, double Scale, string LayoutMode, double SplitRatio, bool Compact,
+    ScreenRegion? Clock, ScreenRegion? Board, Guid? ActiveProjectId);
 
 /// <summary>
 /// 班级布局同步策略：Shared 设备与网页双向同步；Managed 只由网页下发，设备不能上传；Off 不同步布局。

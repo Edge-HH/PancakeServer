@@ -147,7 +147,8 @@ public static class ClassEndpoints
             if (!Access.User(http, sessions, out var session) || !await Access.CanManageClass(session, classId, db)) return Results.StatusCode(StatusCodes.Status403Forbidden);
             var devices = await db.Devices.Where(x => x.ClassId == classId).OrderBy(x => x.Revoked).ThenByDescending(x => x.LastSeenAt).ThenBy(x => x.DeviceName).ToListAsync();
             return Results.Ok(devices.Select(x => new DeviceItem(x.Id, x.DeviceName, x.CreatedAt, x.LastSeenAt, x.Revoked,
-                x.AppVersion, x.LastSyncAt, x.PendingChanges, x.LastError, x.ActiveProject, !x.Revoked && hub.IsDeviceOnline(classId, x.Id))));
+                x.AppVersion, x.LastSyncAt, x.PendingChanges, x.LastError, x.ActiveProject, !x.Revoked && hub.IsDeviceOnline(classId, x.Id),
+                x.ActiveProjectId, Screen(x.ScreenJson), x.ScreenAt)));
         });
 
         app.MapPatch("/api/classes/{classId:guid}/devices/{deviceId:guid}", async (HttpRequest http, Guid classId, Guid deviceId, RenameRequest request, PancakeDbContext db, SessionStore sessions) =>
@@ -250,13 +251,22 @@ public static class ClassEndpoints
             query = query.Where(x => db.Memberships.Any(m => m.ClassId == x.Id && m.UserId == session.UserId));
         var rows = await query.OrderBy(x => x.Name).Select(x => new
         {
-            x.Id, x.Name, x.PublicCode, x.CreatedAt,
+            x.Id, x.Name, x.PublicCode, x.CreatedAt, x.GroupId,
             Projects = db.Projects.Count(p => p.ClassId == x.Id && !p.Deleted),
             Devices = db.Devices.Count(d => d.ClassId == x.Id && !d.Revoked),
             Teachers = db.Memberships.Count(m => m.ClassId == x.Id),
             LastUpdated = db.Projects.Where(p => p.ClassId == x.Id).Max(p => (DateTime?)p.UpdatedAt)
         }).ToListAsync();
-        return rows.Select(x => new ClassDetail(x.Id, x.Name, x.PublicCode, x.CreatedAt, x.Projects, x.Devices, x.Teachers, x.LastUpdated, hub.Count(x.Id))).ToList();
+        var groups = await db.ClassGroups.ToDictionaryAsync(x => x.Id, x => x.Name);
+        return rows.Select(x => new ClassDetail(x.Id, x.Name, x.PublicCode, x.CreatedAt, x.Projects, x.Devices, x.Teachers, x.LastUpdated, hub.OnlineDevices(x.Id),
+            x.GroupId is { } g && groups.ContainsKey(g) ? g : null, x.GroupId is { } id ? groups.GetValueOrDefault(id) : null)).ToList();
+    }
+
+    private static DeviceScreenReport? Screen(string json)
+    {
+        if (string.IsNullOrEmpty(json)) return null;
+        try { return JsonSerializer.Deserialize<DeviceScreenReport>(json, BoardEndpoints.ScreenJson); }
+        catch (JsonException) { return null; }
     }
 
     private static async Task<string> UniquePublicCode(PancakeDbContext db)

@@ -15,10 +15,19 @@ public sealed class EditDeniedException(string message) : Exception(message);
 public static class PayloadEditor
 {
     private const double TileWidth = 430, TileHeight = 320, TileGap = 48;
+    /// <summary>大屏新建作业条目时的占位文字，不算作业内容。</summary>
+    public const string Placeholder = "在这里输入作业内容";
+    /// <summary>项目配色的取值与桌面端校验一致：其他值会让大屏拒收整个项目。</summary>
+    public static readonly string[] Themes = ["Dark", "Light", "Default"];
+    public static readonly string[] Palettes = ["Vivid", "Macaron"];
     // 不转义中文：内容只作为 JSON 传输和存储，不会嵌进网页源码。
     public static readonly JsonSerializerOptions Compact = new() { WriteIndented = false, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 
-    public sealed record EditResult(string PayloadJson, IReadOnlyList<string> ChangedSubjects, IReadOnlyList<string> AssetRefs);
+    /// <summary>AppearanceChanged 表示项目配色（主题或色系）有变化。</summary>
+    public sealed record EditResult(string PayloadJson, IReadOnlyList<string> ChangedSubjects, IReadOnlyList<string> AssetRefs, bool AppearanceChanged = false);
+
+    /// <summary>Copied 为写入目标项目的科目，Skipped 为没有权限改动而跳过的科目，AssetRefs 为复制过去的附件资源。</summary>
+    public sealed record CopyResult(string PayloadJson, IReadOnlyList<string> Copied, IReadOnlyList<string> Skipped, IReadOnlyList<string> AssetRefs);
 
     /// <summary>新建项目；有模板时沿用模板的科目、颜色与位置，清空作业和笔迹。</summary>
     public static string CreatePayload(Guid id, string name, DateOnly? date, string? templateJson)
@@ -95,12 +104,16 @@ public static class PayloadEditor
         return RtfCodec.Normalize(clean);
     }
 
-    public static EditResult ApplyEdit(string payloadJson, IReadOnlyList<SubjectEdit> edits, HashSet<string>? allowed, string? defaultFamily = null, double? defaultSize = null)
+    /// <summary>theme / palette 为项目配色，为空保持不变；只有不受科目限制的人（allowed 为空）可以修改。</summary>
+    public static EditResult ApplyEdit(string payloadJson, IReadOnlyList<SubjectEdit> edits, HashSet<string>? allowed, string? defaultFamily = null, double? defaultSize = null,
+        string? theme = null, string? palette = null)
     {
         JsonObject doc = TryParse(payloadJson) ?? throw new InvalidDataException("项目内容无法解析。");
         JsonArray original = doc["Subjects"] as JsonArray ?? [];
         List<JsonObject> originals = original.OfType<JsonObject>().ToList();
         if (edits.Count > 200) throw new InvalidDataException("科目数量过多。");
+        bool appearance = SetAppearance(doc, theme, palette);
+        if (appearance && allowed is not null) throw new EditDeniedException("项目配色作用于整块大屏，只有班主任和管理员可以修改。");
 
         HashSet<int> referenced = [];
         List<JsonObject> result = [];
@@ -160,8 +173,72 @@ public static class PayloadEditor
         foreach (JsonObject node in result) subjects.Add(node);
         doc["Subjects"] = subjects;
         string json = doc.ToJsonString(Compact);
-        return new EditResult(json, changed, AssetRefs(json).ToList());
+        return new EditResult(json, changed, AssetRefs(json).ToList(), appearance);
     }
+
+    private static bool SetAppearance(JsonObject doc, string? theme, string? palette)
+    {
+        bool changed = false;
+        foreach (var (key, value, allowedValues, label) in new[] { ("Theme", theme, Themes, "主题"), ("Palette", palette, Palettes, "色系") })
+        {
+            if (value is null) continue;
+            if (!allowedValues.Contains(value)) throw new InvalidDataException($"{label}无效。");
+            if (Text(doc[key]) == value) continue;
+            doc[key] = value;
+            changed = true;
+        }
+        return changed;
+    }
+
+    /// <summary>科目里是否布置了作业：有文字（占位文字不算）、附件、手写或笔迹之一。</summary>
+    public static bool HasHomework(JsonObject subject) =>
+        (subject["InkStrokes"] as JsonArray)?.Count > 0
+        || (subject["Entries"] as JsonArray ?? []).OfType<JsonObject>().Any(e =>
+            Text(e["Content"]).Trim() is { Length: > 0 } text && text != Placeholder
+            || (e["Attachments"] as JsonArray)?.Count > 0
+            || (e["HasHandwriting"] is JsonValue v && v.TryGetValue(out bool hand) && hand));
+
+    /// <summary>
+    /// 把来源项目的作业复制到目标项目：同名科目（忽略大小写和首尾空格）替换作业条目与笔迹，保留目标磁贴的位置、大小和颜色；
+    /// 目标里没有的科目整块新增，放到空位上。只复制布置了作业的科目；names 为空表示全部，allowed 为空表示不限科目。
+    /// </summary>
+    public static CopyResult CopySubjects(string sourceJson, string targetJson, IReadOnlySet<string>? names, IReadOnlySet<string>? allowed)
+    {
+        JsonObject source = TryParse(sourceJson) ?? throw new InvalidDataException("来源项目内容无法解析。");
+        JsonObject target = TryParse(targetJson) ?? throw new InvalidDataException("目标项目内容无法解析。");
+        if (target["Subjects"] is not JsonArray subjects) target["Subjects"] = subjects = new JsonArray();
+        List<(double X, double Y, double W, double H)> occupied = subjects.OfType<JsonObject>().Select(Rect).ToList();
+        List<string> copied = [], skipped = [];
+        HashSet<string> refs = [];
+        foreach (JsonObject subject in (source["Subjects"] as JsonArray ?? []).OfType<JsonObject>())
+        {
+            string name = Text(subject["Name"]).Trim();
+            if (name.Length == 0 || (names is not null && !names.Contains(name)) || !HasHomework(subject)) continue;
+            if (allowed is not null && !allowed.Contains(name)) { skipped.Add(name); continue; }
+            JsonObject? match = subjects.OfType<JsonObject>().FirstOrDefault(t => string.Equals(Text(t["Name"]).Trim(), name, StringComparison.OrdinalIgnoreCase));
+            if (match is null)
+            {
+                JsonObject added = (JsonObject)subject.DeepClone();
+                var size = Rect(subject);
+                (double x, double y) = FreeSpot(occupied, size.W > 0 ? size.W : TileWidth, size.H > 0 ? size.H : TileHeight);
+                added["X"] = x; added["Y"] = y;
+                subjects.Add(added);
+            }
+            else
+            {
+                match["Entries"] = subject["Entries"]?.DeepClone() ?? new JsonArray();
+                match["InkStrokes"] = subject["InkStrokes"]?.DeepClone() ?? new JsonArray();
+                if (subject["InkCoordinateVersion"] is { } version) match["InkCoordinateVersion"] = version.DeepClone();
+            }
+            foreach (JsonObject entry in (subject["Entries"] as JsonArray ?? []).OfType<JsonObject>())
+                foreach (JsonObject attachment in (entry["Attachments"] as JsonArray ?? []).OfType<JsonObject>())
+                    if (AssetReference.TryParse(Text(attachment["Path"]), out string sha, out _)) refs.Add(sha);
+            copied.Add(name);
+        }
+        return new CopyResult(target.ToJsonString(Compact), copied, skipped, refs.ToList());
+    }
+
+    private static string Text(JsonNode? node) => node is JsonValue v && v.TryGetValue(out string? s) ? s : "";
 
     /// <summary>项目里引用的服务器资源哈希。</summary>
     public static IEnumerable<string> AssetRefs(string payloadJson)
@@ -285,19 +362,26 @@ public static class PayloadEditor
     /// <summary>新科目放进 3 列网格里第一个不与现有磁贴重叠的位置，大屏上可以再用“自动排列”整理。</summary>
     private static JsonObject NewSubject(string name, List<(double X, double Y, double W, double H)> occupied)
     {
-        (double x, double y) = (TileGap, TileGap);
-        for (int cell = 0; cell < 400; cell++)
-        {
-            double cx = TileGap + cell % 3 * (TileWidth + TileGap), cy = TileGap + cell / 3 * (TileHeight + TileGap);
-            if (!occupied.Any(r => cx < r.X + r.W && r.X < cx + TileWidth && cy < r.Y + r.H && r.Y < cy + TileHeight)) { (x, y) = (cx, cy); break; }
-        }
-        occupied.Add((x, y, TileWidth, TileHeight));
+        (double x, double y) = FreeSpot(occupied, TileWidth, TileHeight);
         return new JsonObject
         {
             ["Name"] = name, ["AccentHex"] = "#818CF8", ["IsAccentExplicit"] = false, ["InkCoordinateVersion"] = 1,
             ["X"] = x, ["Y"] = y, ["Width"] = TileWidth, ["Height"] = TileHeight,
             ["Entries"] = new JsonArray(), ["InkStrokes"] = new JsonArray()
         };
+    }
+
+    /// <summary>3 列网格里第一个放得下 w×h、且不与已有磁贴重叠的格子；找到后记为已占用。</summary>
+    private static (double X, double Y) FreeSpot(List<(double X, double Y, double W, double H)> occupied, double w, double h)
+    {
+        (double x, double y) = (TileGap, TileGap);
+        for (int cell = 0; cell < 400; cell++)
+        {
+            double cx = TileGap + cell % 3 * (TileWidth + TileGap), cy = TileGap + cell / 3 * (TileHeight + TileGap);
+            if (!occupied.Any(r => cx < r.X + r.W && r.X < cx + w && cy < r.Y + r.H && r.Y < cy + h)) { (x, y) = (cx, cy); break; }
+        }
+        occupied.Add((x, y, w, h));
+        return (x, y);
     }
 
     private static (double X, double Y, double W, double H) Rect(JsonObject subject)

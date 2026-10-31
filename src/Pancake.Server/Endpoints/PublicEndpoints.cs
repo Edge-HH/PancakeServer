@@ -46,13 +46,13 @@ public static class PublicEndpoints
         {
             if (!context.WebSockets.IsWebSocketRequest) { context.Response.StatusCode = 400; return; }
             string token = context.Request.Query["access_token"].FirstOrDefault() ?? context.Request.Headers.Authorization.FirstOrDefault()?.Replace("Bearer ", "", StringComparison.OrdinalIgnoreCase) ?? "";
-            Guid? deviceId = null;
+            Guid? deviceId = null, userId = null;
             bool allowed;
-            if (sessions.TryGetSession("Bearer " + token, out var session)) allowed = await Access.CanManageClass(session, classId, db);
+            if (sessions.TryGetSession("Bearer " + token, out var session)) { allowed = await Access.CanManageClass(session, classId, db); userId = session.UserId; }
             else { deviceId = (await Access.DeviceByToken(token, classId, db))?.Id; allowed = deviceId is not null; }
             if (!allowed) { context.Response.StatusCode = 401; return; }
             using var socket = await context.WebSockets.AcceptWebSocketAsync();
-            await hub.HoldAsync(classId, socket, context.RequestAborted, deviceId);
+            await hub.HoldAsync(classId, socket, deviceId is null ? SocketKind.User : SocketKind.Device, deviceId, userId, context.RequestAborted);
         });
 
         app.Map("/ws/public/{publicCode}", async (HttpContext context, string publicCode, ClassSocketHub hub, PancakeDbContext db) =>
@@ -61,7 +61,7 @@ public static class PublicEndpoints
             var classId = await db.Classes.Where(x => x.PublicCode == publicCode.Trim().ToLower() && !x.Deleted).Select(x => (Guid?)x.Id).SingleOrDefaultAsync();
             if (classId is null) { context.Response.StatusCode = 404; return; }
             using var socket = await context.WebSockets.AcceptWebSocketAsync();
-            await hub.HoldAsync(classId.Value, socket, context.RequestAborted);
+            await hub.HoldAsync(classId.Value, socket, SocketKind.Public, null, null, context.RequestAborted);
         });
     }
 }

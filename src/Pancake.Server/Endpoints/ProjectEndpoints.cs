@@ -56,7 +56,19 @@ public static class ProjectEndpoints
             return Results.Created($"/api/classes/{classId}/projects/{id}", ToDetail(project));
         });
 
-        app.MapPut("/api/classes/{classId:guid}/projects/{projectId:guid}", async (HttpRequest http, Guid classId, Guid projectId, ProjectWriteRequest request, PancakeDbContext db, ClassSocketHub hub, SessionStore sessions) =>
+        app.MapPost("/api/classes/{classId:guid}/projects/{projectId:guid}/display", async (HttpRequest http, Guid classId, Guid projectId, PancakeDbContext db, ClassSocketHub hub, SessionStore sessions) =>
+        {
+            if (!Access.User(http, sessions, out var session) || !await Access.CanManageClass(session, classId, db)) return Results.StatusCode(StatusCodes.Status403Forbidden);
+            var project = await db.Projects.SingleOrDefaultAsync(x => x.ClassId == classId && x.ProjectId == projectId);
+            if (project is null) return Results.NotFound();
+            if (project.Deleted) return Results.BadRequest("项目已删除，请先恢复。");
+            bool delivered = await hub.SendToDevicesAsync(new SyncEvent(classId, projectId, project.Revision, SyncEventTypes.Command, Command: DeviceCommands.OpenProject), CancellationToken.None);
+            Access.Audit(db, Access.Actor(session), "在大屏显示项目", $"{project.Name}{(delivered ? "" : "（大屏离线）")}", classId);
+            await db.SaveChangesAsync();
+            return Results.Ok(new { delivered });
+        });
+
+        app.MapPut("/api/classes/{classId:guid}/projects/{projectId:guid}", async (HttpRequest http, Guid classId, Guid projectId, ProjectWriteRequest request, PancakeDbContext db, ClassSocketHub hub, SessionStore sessions, EditLockService locks) =>
         {
             if (await Access.Caller(http, classId, db, sessions) is not { } caller) return Results.StatusCode(StatusCodes.Status403Forbidden);
             if (!await db.Classes.AnyAsync(x => x.Id == classId && !x.Deleted)) return Results.NotFound("班级不存在。");
@@ -64,6 +76,8 @@ public static class ProjectEndpoints
             if (name.Length is < 1 or > 200) return Results.BadRequest("项目名称需为 1–200 个字符。");
             bool keepPayload = request.Deleted && string.IsNullOrEmpty(request.PayloadJson);
             if (!keepPayload && PayloadEditor.TryParse(request.PayloadJson) is null) return Results.BadRequest("项目内容不是有效的 JSON 对象。");
+            // 老师正在网页上修改时，设备的上传留在本机队列里：网页保存后再上传，按冲突合并或另存副本，两边都不丢。
+            if (Held(locks, classId, projectId, caller.Device is not null) is { } held) return held;
             var project = await db.Projects.SingleOrDefaultAsync(x => x.ClassId == classId && x.ProjectId == projectId);
             bool created = project is null;
             if (project is null)
@@ -94,12 +108,13 @@ public static class ProjectEndpoints
         });
 
         // 网页编辑作业：只改文字、科目和图片，磁贴位置与笔迹原样保留；科任老师只能改自己的科目。
-        app.MapPut("/api/classes/{classId:guid}/projects/{projectId:guid}/content", async (HttpRequest http, Guid classId, Guid projectId, HomeworkEditRequest request, PancakeDbContext db, ClassSocketHub hub, SessionStore sessions) =>
+        app.MapPut("/api/classes/{classId:guid}/projects/{projectId:guid}/content", async (HttpRequest http, Guid classId, Guid projectId, HomeworkEditRequest request, PancakeDbContext db, ClassSocketHub hub, SessionStore sessions, EditLockService locks) =>
         {
             if (!Access.User(http, sessions, out var session) || !await Access.CanManageClass(session, classId, db)) return Results.StatusCode(StatusCodes.Status403Forbidden);
             var project = await db.Projects.SingleOrDefaultAsync(x => x.ClassId == classId && x.ProjectId == projectId);
             if (project is null) return Results.NotFound();
             if (project.Deleted) return Results.BadRequest("项目已删除，请先恢复。");
+            if (Held(locks, classId, projectId, byDevice: false) is { } held) return held;
             if (project.Revision != request.ExpectedRevision)
                 return Results.Conflict(new { error = "项目刚刚被班级大屏或其他老师修改，请刷新后重新编辑。", revision = project.Revision });
             PayloadEditor.EditResult result;
@@ -107,23 +122,25 @@ public static class ProjectEndpoints
             var classLayout = PayloadEditor.TryParse((await db.Layouts.FindAsync(classId))?.PayloadJson);
             string? defaultFamily = classLayout?["TileBodyFontFamily"] is JsonValue family && family.TryGetValue(out string? f) ? f : null;
             double? defaultSize = classLayout?["TileBodyFontSize"] is JsonValue size && size.TryGetValue(out double s) ? s : null;
-            try { result = PayloadEditor.ApplyEdit(project.PayloadJson, request.Subjects ?? [], await Access.EditableSubjects(session, classId, db), defaultFamily, defaultSize); }
+            try { result = PayloadEditor.ApplyEdit(project.PayloadJson, request.Subjects ?? [], await Access.EditableSubjects(session, classId, db), defaultFamily, defaultSize, request.Theme, request.Palette); }
             catch (EditDeniedException ex) { return Results.Problem(ex.Message, statusCode: StatusCodes.Status403Forbidden); }
             catch (InvalidDataException ex) { return Results.BadRequest(ex.Message); }
             var known = await db.Assets.Where(x => x.ClassId == classId && result.AssetRefs.Contains(x.Sha256)).Select(x => x.Sha256).ToListAsync();
             if (result.AssetRefs.Except(known).Any()) return Results.BadRequest("有图片尚未上传完成，请重新添加。");
-            if (result.ChangedSubjects.Count == 0) return Results.Ok(ToDetail(project) with { Runs = PayloadEditor.EntryRuns(project.PayloadJson) });
+            if (result.ChangedSubjects.Count == 0 && !result.AppearanceChanged) return Results.Ok(ToDetail(project) with { Runs = PayloadEditor.EntryRuns(project.PayloadJson) });
             project.PayloadJson = result.PayloadJson;
-            Access.Audit(db, Access.Actor(session), "编辑作业", $"{project.Name}：{string.Join("、", result.ChangedSubjects.Take(8))}", classId);
+            IEnumerable<string> what = result.ChangedSubjects.Take(8).Concat(result.AppearanceChanged ? ["配色"] : []);
+            Access.Audit(db, Access.Actor(session), result.ChangedSubjects.Count == 0 ? "修改配色" : "编辑作业", $"{project.Name}：{string.Join("、", what)}", classId);
             await Commit(db, hub, project, Access.Actor(session), SyncEventTypes.Updated);
             return Results.Ok(ToDetail(project) with { Runs = PayloadEditor.EntryRuns(project.PayloadJson) });
         });
 
-        app.MapPatch("/api/classes/{classId:guid}/projects/{projectId:guid}", async (HttpRequest http, Guid classId, Guid projectId, ProjectPatchRequest request, PancakeDbContext db, ClassSocketHub hub, SessionStore sessions) =>
+        app.MapPatch("/api/classes/{classId:guid}/projects/{projectId:guid}", async (HttpRequest http, Guid classId, Guid projectId, ProjectPatchRequest request, PancakeDbContext db, ClassSocketHub hub, SessionStore sessions, EditLockService locks) =>
         {
             if (!Access.User(http, sessions, out var session) || !await Access.CanManageClass(session, classId, db)) return Results.StatusCode(StatusCodes.Status403Forbidden);
             var project = await db.Projects.SingleOrDefaultAsync(x => x.ClassId == classId && x.ProjectId == projectId);
             if (project is null) return Results.NotFound();
+            if (Held(locks, classId, projectId, byDevice: false) is { } held) return held;
             if (request.Name is not null)
             {
                 if (string.IsNullOrWhiteSpace(request.Name) || request.Name.Trim().Length > 80) return Results.BadRequest("项目名称需为 1–80 个字符。");
@@ -137,12 +154,13 @@ public static class ProjectEndpoints
             return Results.Ok(ToDetail(project));
         });
 
-        app.MapDelete("/api/classes/{classId:guid}/projects/{projectId:guid}", async (HttpRequest http, Guid classId, Guid projectId, PancakeDbContext db, ClassSocketHub hub, SessionStore sessions) =>
+        app.MapDelete("/api/classes/{classId:guid}/projects/{projectId:guid}", async (HttpRequest http, Guid classId, Guid projectId, PancakeDbContext db, ClassSocketHub hub, SessionStore sessions, EditLockService locks) =>
         {
             if (!Access.User(http, sessions, out var session) || !await Access.CanManageClass(session, classId, db)) return Results.StatusCode(StatusCodes.Status403Forbidden);
             var project = await db.Projects.SingleOrDefaultAsync(x => x.ClassId == classId && x.ProjectId == projectId);
             if (project is null) return Results.NotFound();
             if (project.Deleted) return Results.NoContent();
+            if (Held(locks, classId, projectId, byDevice: false) is { } held) return held;
             project.Deleted = true;
             Access.Audit(db, Access.Actor(session), "删除项目", project.Name, classId);
             await Commit(db, hub, project, Access.Actor(session), SyncEventTypes.Deleted);
@@ -165,11 +183,12 @@ public static class ProjectEndpoints
         });
 
         // 恢复会生成新的修订号，设备下次同步时会像普通更新一样拉取。
-        app.MapPost("/api/classes/{classId:guid}/projects/{projectId:guid}/restore", async (HttpRequest http, Guid classId, Guid projectId, RestoreRequest request, PancakeDbContext db, ClassSocketHub hub, SessionStore sessions) =>
+        app.MapPost("/api/classes/{classId:guid}/projects/{projectId:guid}/restore", async (HttpRequest http, Guid classId, Guid projectId, RestoreRequest request, PancakeDbContext db, ClassSocketHub hub, SessionStore sessions, EditLockService locks) =>
         {
             if (!Access.User(http, sessions, out var session) || !await Access.CanManageClass(session, classId, db)) return Results.StatusCode(StatusCodes.Status403Forbidden);
             var project = await db.Projects.SingleOrDefaultAsync(x => x.ClassId == classId && x.ProjectId == projectId);
             if (project is null) return Results.NotFound();
+            if (Held(locks, classId, projectId, byDevice: false) is { } held) return held;
             string detail = project.Name;
             if (request.Revision is { } revision)
             {
@@ -183,7 +202,79 @@ public static class ProjectEndpoints
             await Commit(db, hub, project, Access.Actor(session), SyncEventTypes.Updated);
             return Results.Ok(ToDetail(project));
         });
+
+        // 按组批量布置：把本项目已布置的作业复制到其他班级同一天的项目里，没有当天的项目就沿用该班最近的科目布局新建。
+        app.MapPost("/api/classes/{classId:guid}/projects/{projectId:guid}/copy-to", async (HttpRequest http, Guid classId, Guid projectId, CopyHomeworkRequest request, PancakeDbContext db, ClassSocketHub hub, SessionStore sessions, EditLockService locks) =>
+        {
+            if (!Access.User(http, sessions, out var session) || !await Access.CanManageClass(session, classId, db)) return Results.StatusCode(StatusCodes.Status403Forbidden);
+            var source = await db.Projects.AsNoTracking().SingleOrDefaultAsync(x => x.ClassId == classId && x.ProjectId == projectId);
+            if (source is null) return Results.NotFound();
+            if (source.Deleted) return Results.BadRequest("项目已删除，请先恢复。");
+            var targets = (request.ClassIds ?? []).Where(x => x != classId).Distinct().ToList();
+            if (targets.Count is 0 or > 100) return Results.BadRequest("请选择 1–100 个目标班级。");
+            HashSet<string>? names = request.Subjects is { Count: > 0 } subjects ? subjects.Select(x => (x ?? "").Trim()).ToHashSet(StringComparer.OrdinalIgnoreCase) : null;
+            string actor = Access.Actor(session);
+            string sourceClass = await db.Classes.Where(x => x.Id == classId).Select(x => x.Name).SingleAsync();
+            List<CopyHomeworkItem> items = [];
+            foreach (Guid target in targets)
+            {
+                var classroom = await db.Classes.AsNoTracking().SingleOrDefaultAsync(x => x.Id == target && !x.Deleted);
+                if (classroom is null) continue;
+                CopyHomeworkItem Skip(string error, Guid? id = null) => new(target, classroom.Name, id, false, [], [], error);
+                if (!await Access.CanManageClass(session, target, db)) { items.Add(Skip("没有这个班级的权限。")); continue; }
+                var project = await SameDay(db, target, source);
+                if (project is not null && locks.Find(target, project.ProjectId) is { } held)
+                {
+                    items.Add(Skip(held.Holder == EditLockHolders.Device ? $"大屏“{held.Name}”正在编辑这个项目。" : $"{held.Name}正在网页上编辑这个项目。", project.ProjectId));
+                    continue;
+                }
+                bool created = project is null;
+                if (project is null)
+                {
+                    var template = await db.Projects.Where(x => x.ClassId == target && !x.Deleted).OrderByDescending(x => x.Date).ThenByDescending(x => x.UpdatedAt).FirstOrDefaultAsync();
+                    Guid id = Guid.NewGuid();
+                    project = new ServerProject { ClassId = target, ProjectId = id, Name = source.Name, Date = source.Date, PayloadJson = PayloadEditor.CreatePayload(id, source.Name, source.Date, template?.PayloadJson) };
+                }
+                PayloadEditor.CopyResult copy;
+                try { copy = PayloadEditor.CopySubjects(source.PayloadJson, project.PayloadJson, names, await Access.EditableSubjects(session, target, db)); }
+                catch (InvalidDataException ex) { items.Add(Skip(ex.Message, created ? null : project.ProjectId)); continue; }
+                if (copy.Copied.Count == 0)
+                {
+                    items.Add(new CopyHomeworkItem(target, classroom.Name, created ? null : project.ProjectId, false, [], [.. copy.Skipped], copy.Skipped.Count > 0 ? "没有可以改动的科目。" : "没有已布置作业的科目。"));
+                    continue;
+                }
+                if (created) db.Projects.Add(project);
+                await AssetEndpoints.ShareAsync(db, classId, target, copy.AssetRefs, actor);
+                project.PayloadJson = copy.PayloadJson;
+                Access.Audit(db, actor, created ? "新建项目" : "编辑作业", $"{project.Name}：{string.Join("、", copy.Copied.Take(8))}（从{sourceClass}复制）", target);
+                await Commit(db, hub, project, actor, SyncEventTypes.Updated);
+                items.Add(new CopyHomeworkItem(target, classroom.Name, project.ProjectId, created, [.. copy.Copied], [.. copy.Skipped], null));
+            }
+            var done = items.Where(x => x.Error is null).Select(x => x.ClassName).ToList();
+            Access.Audit(db, actor, "复制作业到其他班级", $"{source.Name} → {(done.Count == 0 ? "无" : string.Join("、", done))}", classId);
+            await db.SaveChangesAsync();
+            return Results.Ok(items);
+        });
     }
+
+    /// <summary>目标班级里与来源同一天的项目：同名优先，其次最近修改的；来源没有日期时只找同名的无日期项目。</summary>
+    private static async Task<ServerProject?> SameDay(PancakeDbContext db, Guid classId, ServerProject source)
+    {
+        var candidates = source.Date is { } date
+            ? await db.Projects.Where(x => x.ClassId == classId && !x.Deleted && x.Date == date).ToListAsync()
+            : await db.Projects.Where(x => x.ClassId == classId && !x.Deleted && x.Date == null && x.Name == source.Name).ToListAsync();
+        return candidates.OrderByDescending(x => x.Name == source.Name).ThenByDescending(x => x.UpdatedAt).FirstOrDefault();
+    }
+
+    /// <summary>编辑占用拦截：老师在网页上编辑时拦住设备上传，大屏在编辑时拦住网页保存。423 响应附带当前占用。</summary>
+    private static IResult? Held(EditLockService locks, Guid classId, Guid projectId, bool byDevice) =>
+        locks.Blocking(classId, projectId, byDevice) is { } held
+            ? Results.Json(new
+            {
+                error = byDevice ? $"云端修改中：{held.Name}正在网页上编辑这个项目，保存后才能上传。" : $"本地修改中：大屏“{held.Name}”正在编辑这个项目。",
+                @lock = held
+            }, statusCode: StatusCodes.Status423Locked)
+            : null;
 
     private static async Task<IResult?> CanRead(HttpRequest http, Guid classId, PancakeDbContext db, SessionStore sessions)
     {

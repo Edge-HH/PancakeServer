@@ -107,6 +107,59 @@ void Check(bool value, string message) { if (!value) throw new Exception("FAIL: 
     string payload = PayloadEditor.CreatePayload(Guid.NewGuid(), "测试", null, """{"Theme":"Light","Subjects":[{"Name":"语文","X":10,"Y":20,"Width":300,"Height":200,"InkCoordinateVersion":1,"AccentHex":"#123456","Entries":[{"Content":"a"}],"InkStrokes":[{}]}]}""");
     var doc = JsonNode.Parse(payload)!;
     Check(doc["Theme"]!.GetValue<string>() == "Light" && doc["Subjects"]![0]!["X"]!.GetValue<double>() == 10 && doc["Subjects"]![0]!["Entries"]!.AsArray().Count == 0 && doc["Subjects"]![0]!["InkStrokes"]!.AsArray().Count == 0, "模板应保留位置并清空内容与笔迹");
+
+    // 项目配色：随内容一起保存，取值受限，受科目限制的老师不能改
+    var themed = PayloadEditor.ApplyEdit(payload, [new SubjectEdit(0, "语文", null, [])], null, theme: "Default", palette: "Macaron");
+    var themedDoc = JsonNode.Parse(themed.PayloadJson)!;
+    Check(themed.AppearanceChanged && themed.ChangedSubjects.Count == 0 && themedDoc["Theme"]!.GetValue<string>() == "Default" && themedDoc["Palette"]!.GetValue<string>() == "Macaron", "项目配色写入项目");
+    Check(!PayloadEditor.ApplyEdit(themed.PayloadJson, [new SubjectEdit(0, "语文", null, [])], null, theme: "Default").AppearanceChanged, "配色没变不算改动");
+    bool badTheme = false, deniedTheme = false;
+    try { PayloadEditor.ApplyEdit(payload, [], null, theme: "Neon"); } catch (InvalidDataException) { badTheme = true; }
+    try { PayloadEditor.ApplyEdit(payload, [new SubjectEdit(0, "语文", null, [])], ["语文"], palette: "Macaron"); } catch (EditDeniedException) { deniedTheme = true; }
+    Check(badTheme && deniedTheme, "非法配色被拒绝，受科目限制的老师不能改配色");
+
+    // 复制作业：同名科目替换内容、保留目标位置；目标没有的科目放到空位；没权限的科目跳过
+    string copySource = """{"Subjects":[{"Name":"语文","X":0,"Y":0,"Width":300,"Height":200,"Entries":[{"Content":"背诵","Attachments":[{"Path":"asset:""" + new string('c', 64) + """.png"}]}],"InkStrokes":[]},{"Name":"数学","X":0,"Y":0,"Width":300,"Height":200,"Entries":[{"Content":"在这里输入作业内容"}],"InkStrokes":[]},{"Name":"英语","X":0,"Y":0,"Width":500,"Height":300,"Entries":[{"Content":"Unit 1"}],"InkStrokes":[]},{"Name":"物理","Entries":[{"Content":"预习"}]}]}""";
+    string copyTarget = """{"Subjects":[{"Name":" 语文 ","AccentHex":"#ABCDEF","X":48,"Y":48,"Width":430,"Height":320,"Entries":[{"Content":"旧作业"}],"InkStrokes":[{}]}]}""";
+    var copiedHomework = PayloadEditor.CopySubjects(copySource, copyTarget, null, new HashSet<string>(["语文", "英语"], StringComparer.OrdinalIgnoreCase));
+    var copiedDoc = JsonNode.Parse(copiedHomework.PayloadJson)!["Subjects"]!.AsArray();
+    Check(copiedHomework.Copied.SequenceEqual(["语文", "英语"]) && copiedHomework.Skipped.SequenceEqual(["物理"]), "只复制有作业且有权限的科目，占位文字不算作业");
+    Check(copiedDoc.Count == 2 && copiedDoc[0]!["Entries"]![0]!["Content"]!.GetValue<string>() == "背诵" && copiedDoc[0]!["X"]!.GetValue<double>() == 48
+        && copiedDoc[0]!["AccentHex"]!.GetValue<string>() == "#ABCDEF" && copiedDoc[0]!["InkStrokes"]!.AsArray().Count == 0, "同名科目替换作业与笔迹，保留位置与颜色");
+    Check(copiedDoc[1]!["Name"]!.GetValue<string>() == "英语" && copiedDoc[1]!["X"]!.GetValue<double>() == 526 && copiedDoc[1]!["Width"]!.GetValue<double>() == 500, "新科目保留大小并放到空位");
+    Check(copiedHomework.AssetRefs.SequenceEqual([new string('c', 64)]), "复制时列出附件资源");
+
+    // 随项目保存的设置不作为班级设置同步
+    var syncedOnly = SettingsSchema.Sanitize(JsonNode.Parse("""{"Theme":"Light","Palette":"Macaron","GridSize":40}""")!.AsObject());
+    Check(!syncedOnly.ContainsKey("Theme") && !syncedOnly.ContainsKey("Palette") && syncedOnly["GridSize"]!.GetValue<double>() == 40, "班级设置校验丢弃主题与色系");
+    Check(!SettingsSchema.Keys.Contains("Theme") && SettingsSchema.Find("Palette") is not null
+        && SettingsSchema.ChangedKeys(JsonNode.Parse("""{"Theme":"Dark"}""")!.AsObject(), new JsonObject()).Count == 0, "主题与色系仍登记，但不参与同步与比较");
+}
+
+// ---------------------------------------------------------------- 编辑占用
+{
+    var clock = new ManualClock();
+    var locks = new EditLockService(clock);
+    Guid lockClass = Guid.NewGuid(), lockProject = Guid.NewGuid();
+    var board = EditLockService.Holder.Device(new DeviceRegistration { Id = Guid.NewGuid(), DeviceName = "教室大屏" });
+    var tab1 = new EditLockService.Holder(EditLockHolders.User, null, Guid.NewGuid(), "tab-1", "张老师");
+    var tab2 = tab1 with { ClientId = "tab-2" };
+    Check(locks.Acquire(lockClass, lockProject, board).Outcome == EditLockService.Outcome.Acquired, "大屏占用");
+    var denied = locks.Acquire(lockClass, lockProject, tab1);
+    Check(denied.Outcome == EditLockService.Outcome.Denied && denied.Current.Holder == EditLockHolders.Device && denied.Current.Name == "教室大屏", "大屏占用时网页被拒绝，并告知占用者");
+    Check(locks.Blocking(lockClass, lockProject, byDevice: false) is not null && locks.Blocking(lockClass, lockProject, byDevice: true) is null, "大屏占用只拦网页写入");
+    clock.Advance(TimeSpan.FromSeconds(30));
+    Check(locks.Acquire(lockClass, lockProject, board).Outcome == EditLockService.Outcome.Renewed, "同一占用者再次申请就是续期");
+    clock.Advance(TimeSpan.FromSeconds(30));
+    Check(locks.Find(lockClass, lockProject) is not null, "续期后仍在有效期内");
+    var forced = locks.Acquire(lockClass, lockProject, tab1, force: true);
+    Check(forced.Outcome == EditLockService.Outcome.TakenOver && forced.Previous?.DeviceId == board.DeviceId && forced.Current.ClientId == "tab-1", "老师可以强制接管大屏的占用");
+    Check(locks.Acquire(lockClass, lockProject, tab2, force: true).Outcome == EditLockService.Outcome.Denied, "不能强制接管另一个网页的占用");
+    Check(locks.Blocking(lockClass, lockProject, byDevice: true) is not null && !locks.Release(lockClass, lockProject, tab2), "老师占用拦设备写入；只有占用者能释放");
+    clock.Advance(EditLockService.Ttl + TimeSpan.FromSeconds(1));
+    Check(locks.Find(lockClass, lockProject) is null && locks.List(lockClass).Count == 0, "超过有效期没有续期即失效");
+    var swept = locks.Sweep();
+    Check(swept.Count == 1 && swept[0].ClassId == lockClass && swept[0].Lock.ClientId == "tab-1" && locks.Sweep().Count == 0, "清理过期占用并返回以便通知");
 }
 
 // ---------------------------------------------------------------- 旧库升级
@@ -121,7 +174,7 @@ Directory.CreateDirectory(root);
     {
         connection.Open();
         using var drop = connection.CreateCommand();
-        drop.CommandText = """ALTER TABLE "Layouts" DROP COLUMN "KeyRevisionsJson"; ALTER TABLE "Devices" DROP COLUMN "FontsJson";""";
+        drop.CommandText = """ALTER TABLE "Layouts" DROP COLUMN "KeyRevisionsJson"; ALTER TABLE "Devices" DROP COLUMN "FontsJson"; ALTER TABLE "Devices" DROP COLUMN "ScreenJson"; ALTER TABLE "Classes" DROP COLUMN "GroupId"; DROP TABLE "ClassGroups";""";
         drop.ExecuteNonQuery();
     }
     await PancakeServer.Build(upgradeArgs).DisposeAsync();
@@ -131,6 +184,8 @@ Directory.CreateDirectory(root);
         using var query = connection.CreateCommand();
         query.CommandText = """SELECT dflt_value FROM pragma_table_info('Layouts') WHERE name = 'KeyRevisionsJson'""";
         Check(query.ExecuteScalar() as string == "'{}'", "旧库升级时补齐带花括号默认值的新列");
+        query.CommandText = """SELECT (SELECT count(*) FROM pragma_table_info('Devices') WHERE name = 'ScreenJson') + (SELECT count(*) FROM pragma_table_info('Classes') WHERE name = 'GroupId') + (SELECT count(*) FROM sqlite_master WHERE name = 'ClassGroups')""";
+        Check(Convert.ToInt32(query.ExecuteScalar()) == 3, "旧库升级时补齐屏幕上报、班级分组的列和表");
     }
 }
 
@@ -349,8 +404,139 @@ try
         }
         var ev = JsonSerializer.Deserialize<SyncEvent>(message, web)!;
         Check(ev.Type == SyncEventTypes.Command && ev.Command == "message" && ev.Text == "请检查投影" && ev.DeviceId == paired.DeviceId, "指令内容");
+        var displayed = await Json(await admin.PostAsync($"/api/classes/{classId}/projects/{projectId}/display", null));
+        Check(displayed["delivered"]!.GetValue<bool>(), "在线大屏收到项目切换通知");
+        message = "";
+        while (!message.Contains("open-project"))
+        {
+            var result = await socket.ReceiveAsync(buffer, timeout.Token);
+            message = Encoding.UTF8.GetString(buffer, 0, result.Count);
+        }
+        ev = JsonSerializer.Deserialize<SyncEvent>(message, web)!;
+        Check(ev.Type == SyncEventTypes.Command && ev.Command == "open-project" && ev.ProjectId == projectId && ev.DeviceId is null, "项目切换指令包含目标项目并只广播给大屏");
         await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None);
     }
+
+    // 编辑占用、屏幕上报与实时通知：editing / screen 只发给老师网页，大屏和公开页收不到
+    async Task<ClientWebSocket> Connect(string path, string? deviceToken = null)
+    {
+        var socket = new ClientWebSocket();
+        if (deviceToken is not null) socket.Options.SetRequestHeader("Authorization", "Bearer " + deviceToken);
+        await socket.ConnectAsync(new Uri(baseUrl.Replace("http", "ws") + path), CancellationToken.None);
+        return socket;
+    }
+    async Task<SyncEvent> Next(ClientWebSocket socket, Func<SyncEvent, bool> match, List<SyncEvent>? seen = null)
+    {
+        byte[] chunk = new byte[16384];
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (true)
+        {
+            using var message = new MemoryStream();
+            WebSocketReceiveResult result;
+            do { result = await socket.ReceiveAsync(chunk, timeout.Token); message.Write(chunk, 0, result.Count); } while (!result.EndOfMessage);
+            var ev = JsonSerializer.Deserialize<SyncEvent>(message.ToArray(), web)!;
+            seen?.Add(ev);
+            if (match(ev)) return ev;
+        }
+    }
+    using (var boardSocket = await Connect($"/ws/classes/{classId}", paired.DeviceToken))
+    using (var webSocket = await Connect($"/ws/classes/{classId}?access_token={Uri.EscapeDataString(adminToken)}"))
+    using (var publicSocket = await Connect($"/ws/public/{publicCode}"))
+    {
+        Check((await Json(await admin.GetAsync($"/api/classes/{classId}")))["online"]!.GetValue<int>() == 1, "在线数只算大屏，不算老师网页和公开页");
+        string lockUrl = $"/api/classes/{classId}/projects/{projectId}/edit-lock";
+        var boardLock = await Json(await device.PutAsJsonAsync(lockUrl, new EditLockRequest()));
+        Check(boardLock["holder"]!.GetValue<string>() == EditLockHolders.Device && boardLock["name"]!.GetValue<string>() == "教室大屏", "大屏进入编辑时占用项目");
+        var editing = await Next(webSocket, e => e.Type == SyncEventTypes.Editing);
+        Check(editing.ProjectId == projectId && editing.Lock?.DeviceId == paired.DeviceId, "网页收到大屏占用通知");
+        var held = await Json(await admin.PutAsJsonAsync(lockUrl, new EditLockRequest("tab-1")), HttpStatusCode.Locked);
+        Check(held["holder"]!.GetValue<string>() == EditLockHolders.Device, "大屏编辑时网页不能占用");
+        long revisionNow = (await Json(await admin.GetAsync($"/api/classes/{classId}/projects/{projectId}")))["revision"]!.GetValue<long>();
+        var blockedSave = await Json(await admin.PutAsJsonAsync($"/api/classes/{classId}/projects/{projectId}/content", new { expectedRevision = revisionNow, subjects = Array.Empty<object>() }), HttpStatusCode.Locked);
+        Check(blockedSave["error"]!.GetValue<string>().StartsWith("本地修改中") && blockedSave["lock"]!["deviceId"]!.GetValue<Guid>() == paired.DeviceId, "大屏编辑时网页保存返回 423 和占用信息");
+        var ended = await Json(await admin.PostAsync($"{lockUrl}/end", null));
+        Check(ended["delivered"]!.GetValue<bool>(), "结束编辑的请求送达大屏");
+        var endEdit = await Next(boardSocket, e => e.Type == SyncEventTypes.Command);
+        Check(endEdit.Command == DeviceCommands.EndEdit && endEdit.ProjectId == projectId && endEdit.DeviceId == paired.DeviceId && endEdit.Text == "系统管理员", "大屏收到结束编辑指令和请求人");
+        await Json(await device.DeleteAsync(lockUrl), HttpStatusCode.NoContent);
+        Check((await Next(webSocket, e => e.Type == SyncEventTypes.Editing)).Lock is null, "大屏释放后网页收到通知");
+
+        var webLock = await Json(await admin.PutAsJsonAsync(lockUrl, new EditLockRequest("tab-1")));
+        Check(webLock["holder"]!.GetValue<string>() == EditLockHolders.User && webLock["clientId"]!.GetValue<string>() == "tab-1", "网页开始修改时占用");
+        await Json(await admin.PutAsJsonAsync(lockUrl, new EditLockRequest("tab-2")), HttpStatusCode.Locked);
+        var blockedUpload = await Json(await device.PutAsJsonAsync($"/api/classes/{classId}/projects/{projectId}", new ProjectWriteRequest(revisionNow, "10月8日", today, false, projectJson)), HttpStatusCode.Locked);
+        Check(blockedUpload["error"]!.GetValue<string>().StartsWith("云端修改中"), "网页编辑时大屏上传返回 423");
+        Check((await Json(await device.PutAsJsonAsync(lockUrl, new EditLockRequest()), HttpStatusCode.Locked))["name"]!.GetValue<string>() == "系统管理员", "网页编辑时大屏不能进入编辑并得知是谁");
+        Check((await Json(await device.GetAsync($"/api/classes/{classId}/edit-locks"))).AsArray().Single()!["holder"]!.GetValue<string>() == EditLockHolders.User, "列出班级的编辑占用");
+        await Json(await admin.DeleteAsync($"{lockUrl}?clientId=tab-1"), HttpStatusCode.NoContent);
+        Check((await Json(await device.GetAsync($"/api/classes/{classId}/edit-locks"))).AsArray().Count == 0, "网页释放占用");
+
+        await Json(await device.PutAsJsonAsync(lockUrl, new EditLockRequest()));
+        var takeover = await Json(await admin.PutAsJsonAsync(lockUrl, new EditLockRequest("tab-1", Force: true)));
+        Check(takeover["holder"]!.GetValue<string>() == EditLockHolders.User, "大屏没有响应时网页可以强制接管");
+        Check((await Next(boardSocket, e => e.Type == SyncEventTypes.Command)).Command == DeviceCommands.EndEdit, "被接管的大屏收到结束编辑指令");
+        await Json(await admin.DeleteAsync($"{lockUrl}?clientId=tab-1"), HttpStatusCode.NoContent);
+
+        var screen = new DeviceScreenReport(1920, 1080, 1.5, "Split", 0.4, false, new ScreenRegion(0, 0, 768, 1080), new ScreenRegion(768, 0, 1152, 1080), projectId);
+        await Json(await device.PutAsJsonAsync($"/api/classes/{classId}/devices/me/screen", screen), HttpStatusCode.NoContent);
+        var screenEvent = await Next(webSocket, e => e.Type == SyncEventTypes.Screen);
+        Check(screenEvent.DeviceId == paired.DeviceId && screenEvent.Screen?.Board?.Width == 1152 && screenEvent.Screen.Scale == 1.5, "网页实时收到大屏的屏幕与分区");
+        var withScreen = (await Json(await admin.GetAsync($"/api/classes/{classId}/devices"))).AsArray().Single()!;
+        Check(withScreen["screen"]!["clock"]!["width"]!.GetValue<double>() == 768 && withScreen["activeProjectId"]!.GetValue<Guid>() == projectId && withScreen["screenAt"] is not null, "设备列表带最近的屏幕与当前项目");
+        await Json(await device.PutAsJsonAsync($"/api/classes/{classId}/devices/me/screen", screen with { Width = -1 }), HttpStatusCode.BadRequest);
+        await Json(await device.PutAsJsonAsync($"/api/classes/{classId}/devices/me/screen", screen with { LayoutMode = "Grid" }), HttpStatusCode.BadRequest);
+
+        // 用一条项目通知收尾：大屏和公开页在它之前不应收到 editing 或 screen
+        await Json(await admin.PatchAsJsonAsync($"/api/classes/{classId}/projects/{projectId}", new ProjectPatchRequest("10月8日", today)));
+        List<SyncEvent> boardSeen = [], publicSeen = [];
+        await Next(boardSocket, e => e.Type == SyncEventTypes.Updated, boardSeen);
+        await Next(publicSocket, e => e.Type == SyncEventTypes.Updated, publicSeen);
+        Check(boardSeen.Concat(publicSeen).All(e => e.Type is not (SyncEventTypes.Editing or SyncEventTypes.Screen)), "大屏和公开页收不到编辑占用与屏幕通知");
+    }
+
+    // 项目配色：随项目保存；受科目限制的老师不能改；不再作为班级设置同步
+    long schemeRevision = (await Json(await admin.GetAsync($"/api/classes/{classId}/projects/{projectId}")))["revision"]!.GetValue<long>();
+    var schemeSubjects = JsonNode.Parse((await Json(await admin.GetAsync($"/api/classes/{classId}/projects/{projectId}")))["payloadJson"]!.GetValue<string>())!["Subjects"]!.AsArray()
+        .Select((s, i) => new { index = i, name = s!["Name"]!.GetValue<string>(), entries = s["Entries"]!.AsArray().Select((_, j) => new { index = j, content = s["Entries"]![j]!["Content"]!.GetValue<string>() }).ToArray() }).ToArray();
+    var schemed = await Json(await admin.PutAsJsonAsync($"/api/classes/{classId}/projects/{projectId}/content", new { expectedRevision = schemeRevision, subjects = schemeSubjects, theme = "Light", palette = "Macaron" }));
+    var schemedDoc = JsonNode.Parse(schemed["payloadJson"]!.GetValue<string>())!;
+    Check(schemed["revision"]!.GetValue<long>() == schemeRevision + 1 && schemedDoc["Theme"]!.GetValue<string>() == "Light" && schemedDoc["Palette"]!.GetValue<string>() == "Macaron", "网页修改项目配色");
+    await Json(await admin.PutAsJsonAsync($"/api/classes/{classId}/projects/{projectId}/content", new { expectedRevision = schemeRevision + 1, subjects = schemeSubjects, theme = "Neon" }), HttpStatusCode.BadRequest);
+    await Json(await math.PutAsJsonAsync($"/api/classes/{classId}/projects/{projectId}/content", new { expectedRevision = schemeRevision + 1, subjects = schemeSubjects, palette = "Vivid" }), HttpStatusCode.Forbidden);
+    // 设置键区分大小写，用字典避免被序列化成驼峰。
+    await Json(await admin.PatchAsJsonAsync($"/api/classes/{classId}/layout", new { baseRevision = 0, set = new Dictionary<string, object> { ["Theme"] = "Light" } }), HttpStatusCode.BadRequest);
+    var themedLayout = await Json(await admin.PatchAsJsonAsync($"/api/classes/{classId}/layout", new { baseRevision = 99, set = new Dictionary<string, object> { ["Palette"] = "Macaron", ["GridSize"] = 40 } }));
+    Check(themedLayout["payloadJson"]!.GetValue<string>().Contains("\"GridSize\":40") && !themedLayout["payloadJson"]!.GetValue<string>().Contains("Macaron"), "班级设置里的色系被忽略，其余照常写入");
+
+    // 班级分组与按组批量布置
+    var group = await Json(await admin.PostAsJsonAsync("/api/admin/class-groups", new ClassGroupWriteRequest("高一年级")), HttpStatusCode.Created);
+    Guid groupId = group["id"]!.GetValue<Guid>();
+    await Json(await admin.PostAsJsonAsync("/api/admin/class-groups", new ClassGroupWriteRequest(" 高一年级 ")), HttpStatusCode.BadRequest);
+    await Json(await math.PostAsJsonAsync("/api/admin/class-groups", new ClassGroupWriteRequest("越权")), HttpStatusCode.Forbidden);
+    await Json(await admin.PutAsJsonAsync($"/api/admin/classes/{classId}/group", new ClassGroupAssignRequest(groupId)), HttpStatusCode.NoContent);
+    await Json(await admin.PutAsJsonAsync($"/api/admin/classes/{class2}/group", new ClassGroupAssignRequest(groupId)), HttpStatusCode.NoContent);
+    await Json(await admin.PutAsJsonAsync($"/api/admin/classes/{class2}/group", new ClassGroupAssignRequest(Guid.NewGuid())), HttpStatusCode.NotFound);
+    var grouped = (await Json(await admin.GetAsync("/api/classes"))).AsArray();
+    Check(grouped.All(c => c!["groupName"]!.GetValue<string>() == "高一年级"), "班级列表带分组名称");
+    Guid group2 = (await Json(await admin.PostAsJsonAsync("/api/admin/class-groups", new ClassGroupWriteRequest("高二年级")), HttpStatusCode.Created))["id"]!.GetValue<Guid>();
+    await Json(await admin.PutAsJsonAsync("/api/admin/class-groups/order", new ClassGroupOrderRequest([group2, groupId])), HttpStatusCode.NoContent);
+    var adminGroups = (await Json(await admin.GetAsync("/api/class-groups"))).AsArray();
+    Check(adminGroups.Count == 2 && adminGroups[0]!["id"]!.GetValue<Guid>() == group2 && adminGroups[1]!["classCount"]!.GetValue<int>() == 2, "分组按指定顺序排列并统计班级数");
+    var mathGroups = (await Json(await math.GetAsync("/api/class-groups"))).AsArray();
+    Check(mathGroups.Count == 1 && mathGroups[0]!["classCount"]!.GetValue<int>() == 1, "老师只看到含自己班级的分组，只数自己的班级");
+    await Json(await admin.PatchAsJsonAsync($"/api/admin/class-groups/{group2}", new ClassGroupWriteRequest("高二")), HttpStatusCode.NoContent);
+    await Json(await admin.DeleteAsync($"/api/admin/class-groups/{group2}"), HttpStatusCode.NoContent);
+
+    var copiedTo = (await Json(await admin.PostAsJsonAsync($"/api/classes/{classId}/projects/{projectId}/copy-to", new CopyHomeworkRequest([class2], null)))).AsArray().Single()!;
+    Guid copiedProject = copiedTo["projectId"]!.GetValue<Guid>();
+    Check(copiedTo["created"]!.GetValue<bool>() && copiedTo["error"] is null && copiedTo["copied"]!.AsArray().Select(x => x!.GetValue<string>()).SequenceEqual(["语文", "数学", "英语"]), "复制到同组班级：没有当天的项目时新建");
+    var targetDetail = await Json(await admin.GetAsync($"/api/classes/{class2}/projects/{copiedProject}"));
+    Check(targetDetail["date"]!.GetValue<string>() == today.ToString("yyyy-MM-dd") && targetDetail["payloadJson"]!.GetValue<string>().Contains("练习册 P12"), "新项目与来源同一天且带上作业内容");
+    Check((await admin.GetAsync($"/api/classes/{class2}/assets/{webRef[6..70]}")).StatusCode == HttpStatusCode.OK, "复制作业时图片资源一并登记到目标班级");
+    var copiedAgain = (await Json(await admin.PostAsJsonAsync($"/api/classes/{classId}/projects/{projectId}/copy-to", new CopyHomeworkRequest([class2], ["数学"])))).AsArray().Single()!;
+    Check(!copiedAgain["created"]!.GetValue<bool>() && copiedAgain["projectId"]!.GetValue<Guid>() == copiedProject && copiedAgain["copied"]!.AsArray().Single()!.GetValue<string>() == "数学", "再次复制写入同一天的项目，只复制选中的科目");
+    var notMine = (await Json(await math.PostAsJsonAsync($"/api/classes/{classId}/projects/{projectId}/copy-to", new CopyHomeworkRequest([class2], null)))).AsArray().Single()!;
+    Check(notMine["error"]!.GetValue<string>().Contains("权限"), "没有目标班级权限时跳过并说明原因");
 
     var export = await admin.GetStringAsync($"/api/classes/{classId}/export");
     Check(export.Contains("\"students\"") && export.Contains("张三") && export.Contains("\"layout\""), "导出包含名单与布局");
@@ -362,4 +548,12 @@ finally
     await app.DisposeAsync();
     Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     try { Directory.Delete(root, true); } catch (IOException) { }
+}
+
+/// <summary>编辑占用测试用的时钟：只有调用 Advance 才前进。</summary>
+sealed class ManualClock : TimeProvider
+{
+    private DateTimeOffset _now = new(2026, 10, 30, 8, 0, 0, TimeSpan.Zero);
+    public override DateTimeOffset GetUtcNow() => _now;
+    public void Advance(TimeSpan by) => _now += by;
 }

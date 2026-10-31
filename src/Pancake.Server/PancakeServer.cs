@@ -17,6 +17,9 @@ public static class PancakeServer
         builder.Services.AddDbContext<PancakeDbContext>(options => options.UseSqlite(builder.Configuration.GetConnectionString("Pancake") ?? "Data Source=pancake.db"));
         builder.Services.AddSingleton<ClassSocketHub>();
         builder.Services.AddSingleton<SessionStore>();
+        builder.Services.AddSingleton(TimeProvider.System);
+        builder.Services.AddSingleton<EditLockService>();
+        builder.Services.AddHostedService<EditLockSweeper>();
         string assets = builder.Configuration["Pancake:AssetsPath"] ?? "assets";
         if (!Path.IsPathRooted(assets)) assets = Path.Combine(builder.Environment.ContentRootPath, assets);
         long maxMegabytes = long.TryParse(builder.Configuration["Pancake:MaxAssetMegabytes"], out long mb) && mb > 0 ? mb : 200;
@@ -58,7 +61,9 @@ public static class PancakeServer
         app.MapPublicEndpoints();
         app.MapAuthEndpoints();
         app.MapClassEndpoints();
+        app.MapClassGroupEndpoints();
         app.MapProjectEndpoints();
+        app.MapEditLockEndpoints();
         app.MapLayoutEndpoints();
         app.MapAssetEndpoints();
         app.MapPeopleEndpoints();
